@@ -128,6 +128,11 @@ func TestAddFlags(t *testing.T) {
 		"--service-cluster-ip-range=192.168.128.0/17",
 		"--lease-reuse-duration-seconds=100",
 		"--emulated-version=test=1.31",
+		"--emulation-forward-compatible=true",
+		"--runtime-config-emulation-forward-compatible=true",
+		"--coordinated-leadership-lease-duration=10s",
+		"--coordinated-leadership-renew-deadline=5s",
+		"--coordinated-leadership-retry-period=1s",
 	}
 	fs.Parse(args)
 	utilruntime.Must(componentGlobalsRegistry.Set())
@@ -136,17 +141,19 @@ func TestAddFlags(t *testing.T) {
 	expected := &ServerRunOptions{
 		Options: &controlplaneapiserver.Options{
 			GenericServerRunOptions: &apiserveroptions.ServerRunOptions{
-				AdvertiseAddress:             netutils.ParseIPSloppy("192.168.10.10"),
-				CorsAllowedOriginList:        []string{"10.10.10.100", "10.10.10.200"},
-				MaxRequestsInFlight:          400,
-				MaxMutatingRequestsInFlight:  200,
-				RequestTimeout:               time.Duration(2) * time.Minute,
-				MinRequestTimeout:            1800,
-				StorageInitializationTimeout: time.Minute,
-				JSONPatchMaxCopyBytes:        int64(3 * 1024 * 1024),
-				MaxRequestBodyBytes:          int64(3 * 1024 * 1024),
-				ComponentGlobalsRegistry:     componentGlobalsRegistry,
-				ComponentName:                basecompatibility.DefaultKubeComponent,
+				AdvertiseAddress:                        netutils.ParseIPSloppy("192.168.10.10"),
+				CorsAllowedOriginList:                   []string{"10.10.10.100", "10.10.10.200"},
+				MaxRequestsInFlight:                     400,
+				MaxMutatingRequestsInFlight:             200,
+				RequestTimeout:                          time.Duration(2) * time.Minute,
+				MinRequestTimeout:                       1800,
+				StorageInitializationTimeout:            time.Minute,
+				JSONPatchMaxCopyBytes:                   int64(3 * 1024 * 1024),
+				MaxRequestBodyBytes:                     int64(3 * 1024 * 1024),
+				ComponentGlobalsRegistry:                componentGlobalsRegistry,
+				ComponentName:                           basecompatibility.DefaultKubeComponent,
+				EmulationForwardCompatible:              true,
+				RuntimeConfigEmulationForwardCompatible: true,
 			},
 			Admission: &kubeoptions.AdmissionOptions{
 				GenericAdmission: &apiserveroptions.AdmissionOptions{
@@ -303,6 +310,9 @@ func TestAddFlags(t *testing.T) {
 			},
 			AggregatorRejectForwardingRedirects: true,
 			SystemNamespaces:                    []string{"kube-system", "kube-public", "default", "kube-node-lease"},
+			CoordinatedLeadershipLeaseDuration:  10 * time.Second,
+			CoordinatedLeadershipRenewDeadline:  5 * time.Second,
+			CoordinatedLeadershipRetryPeriod:    1 * time.Second,
 		},
 
 		Extra: Extra{

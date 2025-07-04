@@ -29,6 +29,10 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/component-base/featuregate"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/kubernetes/pkg/features"
 )
 
 func TestFindPort(t *testing.T) {
@@ -426,6 +430,147 @@ func TestVisitContainers(t *testing.T) {
 	}
 }
 
+func TestContainerIter(t *testing.T) {
+	testCases := []struct {
+		desc           string
+		spec           *v1.PodSpec
+		wantContainers []string
+		mask           ContainerType
+	}{
+		{
+			desc:           "empty podspec",
+			spec:           &v1.PodSpec{},
+			wantContainers: []string{},
+			mask:           AllContainers,
+		},
+		{
+			desc: "regular containers",
+			spec: &v1.PodSpec{
+				Containers: []v1.Container{
+					{Name: "c1"},
+					{Name: "c2"},
+				},
+				InitContainers: []v1.Container{
+					{Name: "i1"},
+					{Name: "i2"},
+				},
+				EphemeralContainers: []v1.EphemeralContainer{
+					{EphemeralContainerCommon: v1.EphemeralContainerCommon{Name: "e1"}},
+					{EphemeralContainerCommon: v1.EphemeralContainerCommon{Name: "e2"}},
+				},
+			},
+			wantContainers: []string{"c1", "c2"},
+			mask:           Containers,
+		},
+		{
+			desc: "init containers",
+			spec: &v1.PodSpec{
+				Containers: []v1.Container{
+					{Name: "c1"},
+					{Name: "c2"},
+				},
+				InitContainers: []v1.Container{
+					{Name: "i1"},
+					{Name: "i2"},
+				},
+				EphemeralContainers: []v1.EphemeralContainer{
+					{EphemeralContainerCommon: v1.EphemeralContainerCommon{Name: "e1"}},
+					{EphemeralContainerCommon: v1.EphemeralContainerCommon{Name: "e2"}},
+				},
+			},
+			wantContainers: []string{"i1", "i2"},
+			mask:           InitContainers,
+		},
+		{
+			desc: "init + main containers",
+			spec: &v1.PodSpec{
+				Containers: []v1.Container{
+					{Name: "c1"},
+					{Name: "c2"},
+				},
+				InitContainers: []v1.Container{
+					{Name: "i1"},
+					{Name: "i2"},
+				},
+				EphemeralContainers: []v1.EphemeralContainer{
+					{EphemeralContainerCommon: v1.EphemeralContainerCommon{Name: "e1"}},
+					{EphemeralContainerCommon: v1.EphemeralContainerCommon{Name: "e2"}},
+				},
+			},
+			wantContainers: []string{"i1", "i2", "c1", "c2"},
+			mask:           InitContainers | Containers,
+		},
+		{
+			desc: "ephemeral containers",
+			spec: &v1.PodSpec{
+				Containers: []v1.Container{
+					{Name: "c1"},
+					{Name: "c2"},
+				},
+				InitContainers: []v1.Container{
+					{Name: "i1"},
+					{Name: "i2"},
+				},
+				EphemeralContainers: []v1.EphemeralContainer{
+					{EphemeralContainerCommon: v1.EphemeralContainerCommon{Name: "e1"}},
+					{EphemeralContainerCommon: v1.EphemeralContainerCommon{Name: "e2"}},
+				},
+			},
+			wantContainers: []string{"e1", "e2"},
+			mask:           EphemeralContainers,
+		},
+		{
+			desc: "all container types",
+			spec: &v1.PodSpec{
+				Containers: []v1.Container{
+					{Name: "c1"},
+					{Name: "c2"},
+				},
+				InitContainers: []v1.Container{
+					{Name: "i1"},
+					{Name: "i2"},
+				},
+				EphemeralContainers: []v1.EphemeralContainer{
+					{EphemeralContainerCommon: v1.EphemeralContainerCommon{Name: "e1"}},
+					{EphemeralContainerCommon: v1.EphemeralContainerCommon{Name: "e2"}},
+				},
+			},
+			wantContainers: []string{"i1", "i2", "c1", "c2", "e1", "e2"},
+			mask:           AllContainers,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			gotContainers := []string{}
+			for c, containerType := range ContainerIter(tc.spec, tc.mask) {
+				gotContainers = append(gotContainers, c.Name)
+
+				switch containerType {
+				case InitContainers:
+					if c.Name[0] != 'i' {
+						t.Errorf("ContainerIter() yielded container type InitContainers for container %q", c.Name)
+					}
+				case Containers:
+					if c.Name[0] != 'c' {
+						t.Errorf("ContainerIter() yielded container type Containers for container %q", c.Name)
+					}
+				case EphemeralContainers:
+					if c.Name[0] != 'e' {
+						t.Errorf("ContainerIter() yielded container type EphemeralContainers for container %q", c.Name)
+					}
+				default:
+					t.Errorf("ContainerIter() yielded unknown container type %d", containerType)
+				}
+			}
+
+			if !cmp.Equal(gotContainers, tc.wantContainers) {
+				t.Errorf("ContainerIter() = %+v, want %+v", gotContainers, tc.wantContainers)
+			}
+		})
+	}
+}
+
 func TestPodSecrets(t *testing.T) {
 	// Stub containing all possible secret references in a pod.
 	// The names of the referenced secrets match struct paths detected by reflection.
@@ -761,6 +906,15 @@ func TestIsPodAvailable(t *testing.T) {
 			expected:        false,
 		},
 		{
+			pod: func() *v1.Pod {
+				pod := newPod(now, true, 0)
+				pod.Status.Conditions[0].LastTransitionTime = metav1.Time{}
+				return pod
+			}(),
+			minReadySeconds: 1,
+			expected:        false,
+		},
+		{
 			pod:             newPod(now, true, 0),
 			minReadySeconds: 0,
 			expected:        true,
@@ -769,6 +923,16 @@ func TestIsPodAvailable(t *testing.T) {
 			pod:             newPod(now, true, 51),
 			minReadySeconds: 50,
 			expected:        true,
+		},
+		{
+			pod:             newPod(now, true, 51),
+			minReadySeconds: 51,
+			expected:        true,
+		},
+		{
+			pod:             newPod(now, true, 51),
+			minReadySeconds: 52,
+			expected:        false,
 		},
 	}
 
@@ -1074,5 +1238,155 @@ func TestIsContainersReadyConditionTrue(t *testing.T) {
 	for _, test := range tests {
 		isContainersReady := IsContainersReadyConditionTrue(test.podStatus)
 		assert.Equal(t, test.expected, isContainersReady, test.desc)
+	}
+}
+
+func TestCalculatePodStatusObservedGeneration(t *testing.T) {
+	tests := []struct {
+		name     string
+		pod      *v1.Pod
+		features map[featuregate.Feature]bool
+		expected int64
+	}{
+		{
+			name: "pod with no observedGeneration/PodObservedGenerationTracking=false",
+			pod: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Generation: 5,
+				},
+			},
+			expected: 0,
+		},
+		{
+			name: "pod with no observedGeneration/PodObservedGenerationTracking=true",
+			pod: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Generation: 5,
+				},
+			},
+			features: map[featuregate.Feature]bool{
+				features.PodObservedGenerationTracking: true,
+			},
+			expected: 5,
+		},
+		{
+			name: "pod with observedGeneration/PodObservedGenerationTracking=false",
+			pod: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Generation: 5,
+				},
+				Status: v1.PodStatus{
+					ObservedGeneration: 5,
+				},
+			},
+			expected: 5,
+		},
+		{
+			name: "pod with observedGeneration/PodObservedGenerationTracking=true",
+			pod: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Generation: 5,
+				},
+				Status: v1.PodStatus{
+					ObservedGeneration: 5,
+				},
+			},
+			features: map[featuregate.Feature]bool{
+				features.PodObservedGenerationTracking: true,
+			},
+			expected: 5,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			for f, v := range tc.features {
+				featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, f, v)
+			}
+			assert.Equal(t, tc.expected, CalculatePodStatusObservedGeneration(tc.pod))
+		})
+	}
+}
+
+func TestCalculatePodConditionObservedGeneration(t *testing.T) {
+	tests := []struct {
+		name     string
+		pod      *v1.Pod
+		features map[featuregate.Feature]bool
+		expected int64
+	}{
+		{
+			name: "pod with no observedGeneration/PodObservedGenerationTracking=false",
+			pod: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Generation: 5,
+				},
+				Status: v1.PodStatus{
+					Conditions: []v1.PodCondition{{
+						Type: v1.PodReady,
+					}},
+				},
+			},
+			expected: 0,
+		},
+		{
+			name: "pod with no observedGeneration/PodObservedGenerationTracking=true",
+			pod: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Generation: 5,
+				},
+				Status: v1.PodStatus{
+					Conditions: []v1.PodCondition{{
+						Type: v1.PodReady,
+					}},
+				},
+			},
+			features: map[featuregate.Feature]bool{
+				features.PodObservedGenerationTracking: true,
+			},
+			expected: 5,
+		},
+		{
+			name: "pod with observedGeneration/PodObservedGenerationTracking=false",
+			pod: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Generation: 5,
+				},
+				Status: v1.PodStatus{
+					Conditions: []v1.PodCondition{{
+						Type:               v1.PodReady,
+						ObservedGeneration: 5,
+					}},
+				},
+			},
+			expected: 5,
+		},
+		{
+			name: "pod with observedGeneration/PodObservedGenerationTracking=true",
+			pod: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Generation: 5,
+				},
+				Status: v1.PodStatus{
+					Conditions: []v1.PodCondition{{
+						Type:               v1.PodReady,
+						ObservedGeneration: 5,
+					}},
+				},
+			},
+			features: map[featuregate.Feature]bool{
+				features.PodObservedGenerationTracking: true,
+			},
+			expected: 5,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			for f, v := range tc.features {
+				featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, f, v)
+			}
+			assert.Equal(t, tc.expected, CalculatePodConditionObservedGeneration(&tc.pod.Status, tc.pod.Generation, v1.PodReady))
+		})
 	}
 }

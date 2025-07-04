@@ -131,7 +131,10 @@ func newTestWatchCache(capacity int, eventFreshDuration time.Duration, indexers 
 	wc.stopCh = make(chan struct{})
 	pr := progress.NewConditionalProgressRequester(wc.RequestWatchProgress, &immediateTickerFactory{}, nil)
 	go pr.Run(wc.stopCh)
-	wc.watchCache = newWatchCache(keyFunc, mockHandler, getAttrsFunc, versioner, indexers, testingclock.NewFakeClock(time.Now()), eventFreshDuration, schema.GroupResource{Resource: "pods"}, pr)
+	getCurrentRV := func(context.Context) (uint64, error) {
+		return wc.resourceVersion, nil
+	}
+	wc.watchCache = newWatchCache(keyFunc, mockHandler, getAttrsFunc, versioner, indexers, testingclock.NewFakeClock(time.Now()), eventFreshDuration, schema.GroupResource{Resource: "pods"}, pr, getCurrentRV)
 	// To preserve behavior of tests that assume a given capacity,
 	// resize it to th expected size.
 	wc.capacity = capacity
@@ -287,7 +290,7 @@ func TestEvents(t *testing.T) {
 
 	// Test for Added event.
 	{
-		_, err := store.getAllEventsSince(1, storage.ListOptions{})
+		_, err := store.getAllEventsSince(1, storage.ListOptions{Predicate: storage.Everything})
 		if err == nil {
 			t.Errorf("expected error too old")
 		}
@@ -296,7 +299,7 @@ func TestEvents(t *testing.T) {
 		}
 	}
 	{
-		result, err := store.getAllEventsSince(2, storage.ListOptions{})
+		result, err := store.getAllEventsSince(2, storage.ListOptions{Predicate: storage.Everything})
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -320,13 +323,13 @@ func TestEvents(t *testing.T) {
 
 	// Test with not full cache.
 	{
-		_, err := store.getAllEventsSince(1, storage.ListOptions{})
+		_, err := store.getAllEventsSince(1, storage.ListOptions{Predicate: storage.Everything})
 		if err == nil {
 			t.Errorf("expected error too old")
 		}
 	}
 	{
-		result, err := store.getAllEventsSince(3, storage.ListOptions{})
+		result, err := store.getAllEventsSince(3, storage.ListOptions{Predicate: storage.Everything})
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -354,13 +357,13 @@ func TestEvents(t *testing.T) {
 
 	// Test with full cache - there should be elements from 5 to 9.
 	{
-		_, err := store.getAllEventsSince(3, storage.ListOptions{})
+		_, err := store.getAllEventsSince(3, storage.ListOptions{Predicate: storage.Everything})
 		if err == nil {
 			t.Errorf("expected error too old")
 		}
 	}
 	{
-		result, err := store.getAllEventsSince(4, storage.ListOptions{})
+		result, err := store.getAllEventsSince(4, storage.ListOptions{Predicate: storage.Everything})
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -379,7 +382,7 @@ func TestEvents(t *testing.T) {
 	store.Delete(makeTestPod("pod", uint64(10)))
 
 	{
-		result, err := store.getAllEventsSince(9, storage.ListOptions{})
+		result, err := store.getAllEventsSince(9, storage.ListOptions{Predicate: storage.Everything})
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -410,13 +413,13 @@ func TestMarker(t *testing.T) {
 		makeTestPod("pod2", 9),
 	}, "9")
 
-	_, err := store.getAllEventsSince(8, storage.ListOptions{})
+	_, err := store.getAllEventsSince(8, storage.ListOptions{Predicate: storage.Everything})
 	if err == nil || !strings.Contains(err.Error(), "too old resource version") {
 		t.Errorf("unexpected error: %v", err)
 	}
 	// Getting events from 8 should return no events,
 	// even though there is a marker there.
-	result, err := store.getAllEventsSince(9, storage.ListOptions{})
+	result, err := store.getAllEventsSince(9, storage.ListOptions{Predicate: storage.Everything})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -427,7 +430,7 @@ func TestMarker(t *testing.T) {
 	pod := makeTestPod("pods", 12)
 	store.Add(pod)
 	// Getting events from 8 should still work and return one event.
-	result, err = store.getAllEventsSince(9, storage.ListOptions{})
+	result, err = store.getAllEventsSince(9, storage.ListOptions{Predicate: storage.Everything})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -436,7 +439,7 @@ func TestMarker(t *testing.T) {
 	}
 }
 
-func TestWaitUntilFreshAndList(t *testing.T) {
+func TestWaitUntilFreshAndGetList(t *testing.T) {
 	ctx := context.Background()
 	store := newTestWatchCache(3, DefaultEventFreshDuration, &cache.Indexers{
 		"l:label": func(obj interface{}) ([]string, error) {
@@ -466,7 +469,7 @@ func TestWaitUntilFreshAndList(t *testing.T) {
 	}()
 
 	// list by empty MatchValues.
-	resp, indexUsed, err := store.WaitUntilFreshAndList(ctx, 5, "prefix/", nil)
+	resp, indexUsed, err := store.WaitUntilFreshAndGetList(ctx, "prefix/", storage.ListOptions{ResourceVersion: "5", Recursive: true, Predicate: storage.Everything})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -481,11 +484,15 @@ func TestWaitUntilFreshAndList(t *testing.T) {
 	}
 
 	// list by label index.
-	matchValues := []storage.MatchValue{
-		{IndexName: "l:label", Value: "value1"},
-		{IndexName: "f:spec.nodeName", Value: "node2"},
-	}
-	resp, indexUsed, err = store.WaitUntilFreshAndList(ctx, 5, "prefix/", matchValues)
+	resp, indexUsed, err = store.WaitUntilFreshAndGetList(ctx, "prefix/", storage.ListOptions{ResourceVersion: "5", Recursive: true, Predicate: storage.SelectionPredicate{
+		Label: labels.SelectorFromSet(map[string]string{
+			"label": "value1",
+		}),
+		Field: fields.SelectorFromSet(map[string]string{
+			"spec.nodeName": "node2",
+		}),
+		IndexLabels: []string{"label"},
+	}})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -500,11 +507,15 @@ func TestWaitUntilFreshAndList(t *testing.T) {
 	}
 
 	// list with spec.nodeName index.
-	matchValues = []storage.MatchValue{
-		{IndexName: "l:not-exist-label", Value: "whatever"},
-		{IndexName: "f:spec.nodeName", Value: "node2"},
-	}
-	resp, indexUsed, err = store.WaitUntilFreshAndList(ctx, 5, "prefix/", matchValues)
+	resp, indexUsed, err = store.WaitUntilFreshAndGetList(ctx, "prefix/", storage.ListOptions{ResourceVersion: "5", Recursive: true, Predicate: storage.SelectionPredicate{
+		Label: labels.SelectorFromSet(map[string]string{
+			"not-exist-label": "whatever",
+		}),
+		Field: fields.SelectorFromSet(map[string]string{
+			"spec.nodeName": "node2",
+		}),
+		IndexFields: []string{"spec.nodeName"},
+	}})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -519,10 +530,13 @@ func TestWaitUntilFreshAndList(t *testing.T) {
 	}
 
 	// list with index not exists.
-	matchValues = []storage.MatchValue{
-		{IndexName: "l:not-exist-label", Value: "whatever"},
-	}
-	resp, indexUsed, err = store.WaitUntilFreshAndList(ctx, 5, "prefix/", matchValues)
+	resp, indexUsed, err = store.WaitUntilFreshAndGetList(ctx, "prefix/", storage.ListOptions{ResourceVersion: "5", Recursive: true, Predicate: storage.SelectionPredicate{
+		Label: labels.SelectorFromSet(map[string]string{
+			"not-exist-label": "whatever",
+		}),
+		Field:       fields.Everything(),
+		IndexLabels: []string{"label"},
+	}})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -550,7 +564,7 @@ func TestWaitUntilFreshAndListFromCache(t *testing.T) {
 	}()
 
 	// list from future revision. Requires watch cache to request bookmark to get it.
-	resp, indexUsed, err := store.WaitUntilFreshAndList(ctx, 3, "prefix/", nil)
+	resp, indexUsed, err := store.WaitUntilFreshAndGetList(ctx, "prefix/", storage.ListOptions{ResourceVersion: "3", Recursive: true, Predicate: storage.Everything})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -630,7 +644,7 @@ func TestWaitUntilFreshAndListTimeout(t *testing.T) {
 				store.Add(makeTestPod("bar", 4))
 			}()
 
-			_, _, err := store.WaitUntilFreshAndList(ctx, 4, "", nil)
+			_, _, err := store.WaitUntilFreshAndGetList(ctx, "", storage.ListOptions{ResourceVersion: "4", Predicate: storage.Everything})
 			if !errors.IsTimeout(err) {
 				t.Errorf("expected timeout error but got: %v", err)
 			}
@@ -659,7 +673,7 @@ func TestReflectorForWatchCache(t *testing.T) {
 	defer store.Stop()
 
 	{
-		resp, _, err := store.WaitUntilFreshAndList(ctx, 0, "", nil)
+		resp, _, err := store.WaitUntilFreshAndGetList(ctx, "", storage.ListOptions{ResourceVersion: "", Recursive: true, Predicate: storage.Everything})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -682,7 +696,7 @@ func TestReflectorForWatchCache(t *testing.T) {
 	r.ListAndWatch(wait.NeverStop)
 
 	{
-		resp, _, err := store.WaitUntilFreshAndList(ctx, 10, "", nil)
+		resp, _, err := store.WaitUntilFreshAndGetList(ctx, "", storage.ListOptions{ResourceVersion: "10", Recursive: true, Predicate: storage.Everything})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -994,7 +1008,7 @@ func TestCacheIncreaseDoesNotBreakWatch(t *testing.T) {
 	// Force cache resize.
 	addEvent("key4", 50, later.Add(time.Second))
 
-	_, err := store.getAllEventsSince(15, storage.ListOptions{})
+	_, err := store.getAllEventsSince(15, storage.ListOptions{Predicate: storage.Everything})
 	if err == nil || !strings.Contains(err.Error(), "too old resource version") {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -1257,22 +1271,22 @@ func TestHistogramCacheReadWait(t *testing.T) {
 			want: `
 		# HELP apiserver_watch_cache_read_wait_seconds [ALPHA] Histogram of time spent waiting for a watch cache to become fresh.
     # TYPE apiserver_watch_cache_read_wait_seconds histogram
-      apiserver_watch_cache_read_wait_seconds_bucket{resource="pods",le="0.005"} 1
-      apiserver_watch_cache_read_wait_seconds_bucket{resource="pods",le="0.025"} 1
-      apiserver_watch_cache_read_wait_seconds_bucket{resource="pods",le="0.05"} 1
-      apiserver_watch_cache_read_wait_seconds_bucket{resource="pods",le="0.1"} 1
-      apiserver_watch_cache_read_wait_seconds_bucket{resource="pods",le="0.2"} 1
-      apiserver_watch_cache_read_wait_seconds_bucket{resource="pods",le="0.4"} 1
-      apiserver_watch_cache_read_wait_seconds_bucket{resource="pods",le="0.6"} 1
-      apiserver_watch_cache_read_wait_seconds_bucket{resource="pods",le="0.8"} 1
-      apiserver_watch_cache_read_wait_seconds_bucket{resource="pods",le="1"} 1
-      apiserver_watch_cache_read_wait_seconds_bucket{resource="pods",le="1.25"} 1
-      apiserver_watch_cache_read_wait_seconds_bucket{resource="pods",le="1.5"} 1
-      apiserver_watch_cache_read_wait_seconds_bucket{resource="pods",le="2"} 1
-      apiserver_watch_cache_read_wait_seconds_bucket{resource="pods",le="3"} 1
-      apiserver_watch_cache_read_wait_seconds_bucket{resource="pods",le="+Inf"} 1
-      apiserver_watch_cache_read_wait_seconds_sum{resource="pods"} 0
-      apiserver_watch_cache_read_wait_seconds_count{resource="pods"} 1
+	    apiserver_watch_cache_read_wait_seconds_bucket{group="",resource="pods",le="0.005"} 1
+        apiserver_watch_cache_read_wait_seconds_bucket{group="",resource="pods",le="0.025"} 1
+        apiserver_watch_cache_read_wait_seconds_bucket{group="",resource="pods",le="0.05"} 1
+        apiserver_watch_cache_read_wait_seconds_bucket{group="",resource="pods",le="0.1"} 1
+        apiserver_watch_cache_read_wait_seconds_bucket{group="",resource="pods",le="0.2"} 1
+        apiserver_watch_cache_read_wait_seconds_bucket{group="",resource="pods",le="0.4"} 1
+        apiserver_watch_cache_read_wait_seconds_bucket{group="",resource="pods",le="0.6"} 1
+        apiserver_watch_cache_read_wait_seconds_bucket{group="",resource="pods",le="0.8"} 1
+        apiserver_watch_cache_read_wait_seconds_bucket{group="",resource="pods",le="1"} 1
+        apiserver_watch_cache_read_wait_seconds_bucket{group="",resource="pods",le="1.25"} 1
+        apiserver_watch_cache_read_wait_seconds_bucket{group="",resource="pods",le="1.5"} 1
+        apiserver_watch_cache_read_wait_seconds_bucket{group="",resource="pods",le="2"} 1
+        apiserver_watch_cache_read_wait_seconds_bucket{group="",resource="pods",le="3"} 1
+        apiserver_watch_cache_read_wait_seconds_bucket{group="",resource="pods",le="+Inf"} 1
+        apiserver_watch_cache_read_wait_seconds_sum{group="",resource="pods"} 0
+        apiserver_watch_cache_read_wait_seconds_count{group="",resource="pods"} 1
 `,
 		},
 		{
@@ -1352,7 +1366,7 @@ func TestCacheSnapshots(t *testing.T) {
 	clock.Step(DefaultEventFreshDuration + 1)
 	require.NoError(t, store.Update(makeTestPod("foo", 500)))
 	assert.Equal(t, 1, store.capacity)
-	assert.Equal(t, 1, store.snapshots.snapshots.Len())
+	assert.Equal(t, 1, store.snapshots.Len())
 	_, found = store.snapshots.GetLessOrEqual(499)
 	assert.False(t, found, "Expected overfilled cache to delete events below 500")
 
@@ -1366,7 +1380,7 @@ func TestCacheSnapshots(t *testing.T) {
 	t.Log("Add event to force capacity upsize")
 	require.NoError(t, store.Update(makeTestPod("foo", 600)))
 	assert.Equal(t, 2, store.capacity)
-	assert.Equal(t, 2, store.snapshots.snapshots.Len())
+	assert.Equal(t, 2, store.snapshots.Len())
 
 	t.Log("Test cache on rev 600")
 	lister, found = store.snapshots.GetLessOrEqual(600)

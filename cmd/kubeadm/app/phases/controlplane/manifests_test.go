@@ -31,9 +31,9 @@ import (
 	"github.com/lithammer/dedent"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/sets"
 
-	"k8s.io/apimachinery/pkg/util/intstr"
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	"k8s.io/kubernetes/cmd/kubeadm/app/phases/certs"
@@ -169,8 +169,7 @@ func TestCreateStaticPodFilesAndWrappers(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			// Create temp folder for the test case
-			tmpdir := testutil.SetupTempDir(t)
-			defer os.RemoveAll(tmpdir)
+			tmpdir := t.TempDir()
 
 			// Creates a Cluster Configuration
 			cfg := &kubeadmapi.ClusterConfiguration{
@@ -197,8 +196,7 @@ func TestCreateStaticPodFilesAndWrappers(t *testing.T) {
 
 func TestCreateStaticPodFilesWithPatches(t *testing.T) {
 	// Create temp folder for the test case
-	tmpdir := testutil.SetupTempDir(t)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	// Creates a Cluster Configuration
 	cfg := &kubeadmapi.ClusterConfiguration{
@@ -1044,8 +1042,7 @@ func TestGetControllerManagerCommandExternalCA(t *testing.T) {
 			pkiutiltesting.Reset()
 
 			// Create temp folder for the test case
-			tmpdir := testutil.SetupTempDir(t)
-			defer os.RemoveAll(tmpdir)
+			tmpdir := t.TempDir()
 			test.cfg.CertificatesDir = tmpdir
 
 			if err := certs.CreatePKIAssets(test.cfg); err != nil {

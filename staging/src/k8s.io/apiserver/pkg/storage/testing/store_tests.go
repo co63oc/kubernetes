@@ -29,7 +29,10 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/google/go-cmp/cmp" //nolint:depguard
+	"github.com/google/go-cmp/cmp"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.etcd.io/etcd/client/v3/kubernetes"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -37,8 +40,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/apiserver/pkg/apis/example"
+	"k8s.io/apiserver/pkg/features"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/value"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	utilpointer "k8s.io/utils/pointer"
 )
 
@@ -622,7 +627,7 @@ func RunTestPreconditionalDeleteWithOnlySuggestionPass(ctx context.Context, t *t
 	expectNoDiff(t, "incorrect pod:", updatedPod, out)
 }
 
-func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, compaction Compaction, ignoreWatchCacheTests bool) {
+func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, increaseRV IncreaseRVFunc, watchCacheEnabled bool, recorder *KubernetesRecorder) {
 	initialRV, createdPods, updatedPod, err := seedMultiLevelData(ctx, store)
 	if err != nil {
 		t.Fatal(err)
@@ -648,10 +653,8 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 		pod := obj.(*example.Pod)
 		return nil, fields.Set{"metadata.name": pod.Name, "spec.nodeName": pod.Spec.NodeName}, nil
 	}
-	// Use compact to increase etcd global revision without changes to any resources.
-	// The increase in resources version comes from Kubernetes compaction updating hidden key.
-	// Used to test consistent List to confirm it returns latest etcd revision.
-	compaction(ctx, t, initialRV)
+	// Increase RV to test consistent List.
+	increaseRV(ctx, t)
 	currentRV := fmt.Sprintf("%d", continueRV+1)
 
 	tests := []struct {
@@ -670,6 +673,7 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 		expectRVTooLarge           bool
 		expectRV                   string
 		expectRVFunc               func(string) error
+		expectEtcdRequest          func() []RecordedList
 	}{
 		{
 			name:        "rejects invalid resource version",
@@ -693,6 +697,7 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 		{
 			name:             "rejects resource version set too high",
 			prefix:           "/pods",
+			pred:             storage.Everything,
 			rv:               strconv.FormatInt(math.MaxInt64, 10),
 			expectRVTooLarge: true,
 		},
@@ -813,6 +818,17 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 			expectContinue:             true,
 			expectContinueExact:        encodeContinueOrDie(createdPods[1].Name+"\x00", int64(mustAtoi(currentRV))),
 			expectedRemainingItemCount: utilpointer.Int64(1),
+			expectEtcdRequest: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ConsistentListFromCache) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:         "/registry/pods/second/",
+						ListOptions: kubernetes.ListOptions{Revision: 0, Limit: 1},
+					},
+				}
+			},
 		},
 		{
 			name:   "test List with limit at current resource version",
@@ -1186,7 +1202,7 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 			prefix:       "/pods/empty",
 			pred:         storage.Everything,
 			rv:           "0",
-			expectRVFunc: resourceVersionNotOlderThan(list.ResourceVersion),
+			expectRVFunc: resourceVersionNotOlderThan(initialRV),
 			expectedOut:  []example.Pod{},
 		},
 		// match=Exact
@@ -1493,6 +1509,73 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 			expectContinueExact:        encodeContinueOrDie(createdPods[1].Namespace+"/"+createdPods[1].Name+"\x00", int64(continueRV+1)),
 			expectedRemainingItemCount: utilpointer.Int64(3),
 		},
+		{
+			name:   "test List with continue from second pod, negative resource version gives consistent read",
+			prefix: "/pods/",
+			pred: storage.SelectionPredicate{
+				Label:    labels.Everything(),
+				Field:    fields.Everything(),
+				Continue: encodeContinueOrDie(createdPods[0].Namespace+"/"+createdPods[0].Name+"\x00", -1),
+			},
+			expectedOut: []example.Pod{*createdPods[1], *createdPods[2], *createdPods[3], *createdPods[4]},
+			expectRV:    currentRV,
+		},
+		{
+			name:   "test List with continue from second pod and limit, negative resource version gives consistent read",
+			prefix: "/pods/",
+			pred: storage.SelectionPredicate{
+				Label:    labels.Everything(),
+				Field:    fields.Everything(),
+				Limit:    2,
+				Continue: encodeContinueOrDie(createdPods[0].Namespace+"/"+createdPods[0].Name+"\x00", -1),
+			},
+			expectedOut:                []example.Pod{*createdPods[1], *createdPods[2]},
+			expectContinue:             true,
+			expectContinueExact:        encodeContinueOrDie(createdPods[2].Namespace+"/"+createdPods[2].Name+"\x00", int64(continueRV+1)),
+			expectRV:                   currentRV,
+			expectedRemainingItemCount: utilpointer.Int64(2),
+		},
+		{
+			name:   "test List with continue from third pod, negative resource version gives consistent read",
+			prefix: "/pods/",
+			pred: storage.SelectionPredicate{
+				Label:    labels.Everything(),
+				Field:    fields.Everything(),
+				Continue: encodeContinueOrDie(createdPods[2].Namespace+"/"+createdPods[2].Name+"\x00", -1),
+			},
+			expectedOut: []example.Pod{*createdPods[3], *createdPods[4]},
+			expectRV:    currentRV,
+		},
+		{
+			name:   "test List with continue from empty fails",
+			prefix: "/pods/",
+			pred: storage.SelectionPredicate{
+				Label:    labels.Everything(),
+				Field:    fields.Everything(),
+				Continue: encodeContinueOrDie("", int64(continueRV)),
+			},
+			expectError: true,
+		},
+		{
+			name:   "test List with continue from first pod, empty resource version fails",
+			prefix: "/pods/",
+			pred: storage.SelectionPredicate{
+				Label:    labels.Everything(),
+				Field:    fields.Everything(),
+				Continue: encodeContinueOrDie(createdPods[0].Namespace+"/"+createdPods[0].Name+"\x00", 0),
+			},
+			expectError: true,
+		},
+		{
+			name:   "test List with negative rv fails",
+			prefix: "/pods/",
+			rv:     "-1",
+			pred: storage.SelectionPredicate{
+				Label: labels.Everything(),
+				Field: fields.Everything(),
+			},
+			expectError: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -1507,7 +1590,7 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 			// doesn't automatically preclude some scenarios from happening.
 			t.Parallel()
 
-			if ignoreWatchCacheTests && tt.ignoreForWatchCache {
+			if watchCacheEnabled && tt.ignoreForWatchCache {
 				t.Skip()
 			}
 
@@ -1522,11 +1605,12 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 				Predicate:            tt.pred,
 				Recursive:            true,
 			}
-			err := store.GetList(ctx, tt.prefix, storageOpts, out)
+			recorderKey := t.Name()
+			listCtx := context.WithValue(ctx, recorderContextKey, recorderKey)
+			err := store.GetList(listCtx, tt.prefix, storageOpts, out)
 			if tt.expectRVTooLarge {
-				// TODO: Clasify etcd future revision error as TooLargeResourceVersion
-				if err == nil || !(storage.IsTooLargeResourceVersion(err) || strings.Contains(err.Error(), "etcdserver: mvcc: required revision is a future revision")) {
-					t.Fatalf("expecting resource version too high error, but get: %q", err)
+				if !storage.IsTooLargeResourceVersion(err) {
+					t.Fatalf("expecting resource version too high error, but get: %v", err)
 				}
 				return
 			}
@@ -1569,6 +1653,13 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 			if !cmp.Equal(tt.expectedRemainingItemCount, out.RemainingItemCount) {
 				t.Fatalf("unexpected remainingItemCount, diff: %s", cmp.Diff(tt.expectedRemainingItemCount, out.RemainingItemCount))
 			}
+			if watchCacheEnabled && tt.expectEtcdRequest != nil {
+				expectEtcdLists := tt.expectEtcdRequest()
+				etcdLists := recorder.ListRequestForKey(recorderKey)
+				if !cmp.Equal(expectEtcdLists, etcdLists) {
+					t.Fatalf("unexpected etcd requests, diff: %s", cmp.Diff(expectEtcdLists, etcdLists))
+				}
+			}
 		})
 	}
 }
@@ -1591,64 +1682,96 @@ func ExpectContinueMatches(t *testing.T, expect, got string) {
 	t.Errorf("expected continue token: %s, got: %s", expectDecoded, gotDecoded)
 }
 
-func RunTestConsistentList(ctx context.Context, t *testing.T, store storage.Interface, compaction Compaction, cacheEnabled, consistentReadsSupported bool) {
+func RunTestConsistentList(ctx context.Context, t *testing.T, store storage.Interface, increaseRV IncreaseRVFunc, cacheEnabled, consistentReadsSupported, listFromCacheSnapshot bool) {
 	outPod := &example.Pod{}
 	inPod := &example.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "foo"}}
 	err := store.Create(ctx, computePodKey(inPod), inPod, outPod, 0)
-	if err != nil {
-		t.Errorf("Unexpected error: %v", err)
-	}
-	lastObjecRV := outPod.ResourceVersion
-	compaction(ctx, t, outPod.ResourceVersion)
-	parsedRV, _ := strconv.Atoi(outPod.ResourceVersion)
-	currentRV := fmt.Sprintf("%d", parsedRV+1)
+	require.NoError(t, err)
+	lastResourceWriteRV, err := strconv.Atoi(outPod.ResourceVersion)
+	require.NoError(t, err)
 
-	firstNonConsistentReadRV := lastObjecRV
-	if consistentReadsSupported && !cacheEnabled {
-		firstNonConsistentReadRV = currentRV
-	}
-
-	secondNonConsistentReadRV := lastObjecRV
-	if consistentReadsSupported {
-		secondNonConsistentReadRV = currentRV
-	}
+	increaseRV(ctx, t)
+	consistentRV := lastResourceWriteRV + 1
+	cacheSyncRV := 0
 
 	tcs := []struct {
-		name             string
-		requestRV        string
-		expectResponseRV string
+		name               string
+		requestRV          string
+		continueToken      string
+		validateResponseRV func(*testing.T, int)
 	}{
 		{
-			name:             "Non-consistent list before sync",
-			requestRV:        "0",
-			expectResponseRV: firstNonConsistentReadRV,
+			name:      "Non-consistent list before consistent read",
+			requestRV: "0",
+			validateResponseRV: func(t *testing.T, rv int) {
+				if cacheEnabled {
+					// Cache might not yet observed write
+					assert.LessOrEqual(t, rv, lastResourceWriteRV)
+				} else {
+					// Etcd should always be up to date with consistent RV
+					assert.Equal(t, consistentRV, rv)
+				}
+			},
 		},
 		{
-			name:             "Consistent request returns currentRV",
-			requestRV:        "",
-			expectResponseRV: currentRV,
+			name:      "LIST without RV returns consistent RV",
+			requestRV: "",
+			validateResponseRV: func(t *testing.T, rv int) {
+				assert.Equal(t, consistentRV, rv)
+				cacheSyncRV = rv
+			},
 		},
 		{
-			name:             "Non-consistent request after sync returns currentRV",
-			requestRV:        "0",
-			expectResponseRV: secondNonConsistentReadRV,
+			name:          "List with negative continue RV returns consistent RV",
+			continueToken: encodeContinueOrDie("/pods/a", -1),
+			validateResponseRV: func(t *testing.T, rv int) {
+				assert.Equal(t, consistentRV, rv)
+				if listFromCacheSnapshot {
+					cacheSyncRV = rv
+				}
+			},
+		},
+		{
+			name:      "Non-consistent request after consistent read",
+			requestRV: "0",
+			validateResponseRV: func(t *testing.T, rv int) {
+				if cacheEnabled {
+					if consistentReadsSupported {
+						// Consistent read will sync cache
+						assert.Equal(t, cacheSyncRV, rv)
+					} else {
+						// Without consisten reads cache is not synced
+						assert.LessOrEqual(t, rv, lastResourceWriteRV)
+					}
+				} else {
+					// Etcd always points to newest RV
+					assert.Equal(t, consistentRV, rv)
+				}
+			},
 		},
 	}
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
 			out := &example.PodList{}
 			opts := storage.ListOptions{
+				Recursive:       true,
 				ResourceVersion: tc.requestRV,
-				Predicate:       storage.Everything,
+				Predicate: storage.SelectionPredicate{
+					Label:    labels.Everything(),
+					Field:    fields.Everything(),
+					Continue: tc.continueToken,
+				},
 			}
 			err = store.GetList(ctx, "/pods/empty", opts, out)
-			if err != nil {
-				t.Fatalf("GetList failed: %v", err)
-			}
-			if out.ResourceVersion != tc.expectResponseRV {
-				t.Errorf("resourceVersion in list response want=%s, got=%s", tc.expectResponseRV, out.ResourceVersion)
-			}
+			require.NoError(t, err)
+
+			parsedOutRV, err := strconv.Atoi(out.ResourceVersion)
+			require.NoError(t, err)
+			tc.validateResponseRV(t, parsedOutRV)
 		})
+		// Update RV on each read to test multiple reads for consistent RV.
+		increaseRV(ctx, t)
+		consistentRV++
 	}
 }
 
@@ -1749,7 +1872,7 @@ func seedMultiLevelData(ctx context.Context, store storage.Interface) (initialRV
 	return initialRV, created, updated, nil
 }
 
-func RunTestGetListNonRecursive(ctx context.Context, t *testing.T, compaction Compaction, store storage.Interface) {
+func RunTestGetListNonRecursive(ctx context.Context, t *testing.T, increaseRV IncreaseRVFunc, store storage.Interface) {
 	key, prevStoredObj := testPropagateStore(ctx, t, store, &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "test-ns"}})
 	prevRV, _ := strconv.Atoi(prevStoredObj.ResourceVersion)
 
@@ -1763,10 +1886,8 @@ func RunTestGetListNonRecursive(ctx context.Context, t *testing.T, compaction Co
 		t.Fatalf("update failed: %v", err)
 	}
 	objRV, _ := strconv.Atoi(storedObj.ResourceVersion)
-	// Use compact to increase etcd global revision without changes to any resources.
-	// The increase in resources version comes from Kubernetes compaction updating hidden key.
-	// Used to test consistent List to confirm it returns latest etcd revision.
-	compaction(ctx, t, prevStoredObj.ResourceVersion)
+	// Increase RV to test consistent List.
+	increaseRV(ctx, t)
 
 	tests := []struct {
 		name                 string
@@ -2320,12 +2441,9 @@ func RunTestListContinuationWithFilter(ctx context.Context, t *testing.T, store 
 }
 
 type Compaction func(ctx context.Context, t *testing.T, resourceVersion string)
+type IncreaseRVFunc func(ctx context.Context, t *testing.T)
 
 func RunTestListInconsistentContinuation(ctx context.Context, t *testing.T, store storage.Interface, compaction Compaction) {
-	if compaction == nil {
-		t.Skipf("compaction callback not provided")
-	}
-
 	// Setup storage with the following structure:
 	//  /
 	//   - first/
@@ -3009,43 +3127,84 @@ func RunTestTransformationFailure(ctx context.Context, t *testing.T, store Inter
 	}
 }
 
-func RunTestCount(ctx context.Context, t *testing.T, store storage.Interface) {
-	resourceA := "/foo.bar.io/abc"
+func RunTestStats(ctx context.Context, t *testing.T, store storage.Interface, codec runtime.Codec, transformer value.Transformer, sizeEnabled bool) {
+	assertStats(t, store, sizeEnabled, storage.Stats{ObjectCount: 0, EstimatedAverageObjectSizeBytes: 0})
 
-	// resourceA is intentionally a prefix of resourceB to ensure that the count
-	// for resourceA does not include any objects from resourceB.
-	resourceB := fmt.Sprintf("%sdef", resourceA)
-
-	resourceACountExpected := 5
-	for i := 1; i <= resourceACountExpected; i++ {
-		obj := &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("foo-%d", i)}}
-
-		key := fmt.Sprintf("%s/%d", resourceA, i)
-		if err := store.Create(ctx, key, obj, nil, 0); err != nil {
-			t.Fatalf("Create failed: %v", err)
-		}
+	foo := &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "foo"}}
+	fooKey := computePodKey(foo)
+	if err := store.Create(ctx, fooKey, foo, nil, 0); err != nil {
+		t.Fatalf("Create failed: %v", err)
 	}
+	fooSize := objectSize(t, codec, foo, transformer)
+	assertStats(t, store, sizeEnabled, storage.Stats{ObjectCount: 1, EstimatedAverageObjectSizeBytes: fooSize})
 
-	resourceBCount := 4
-	for i := 1; i <= resourceBCount; i++ {
-		obj := &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("foo-%d", i)}}
-
-		key := fmt.Sprintf("%s/%d", resourceB, i)
-		if err := store.Create(ctx, key, obj, nil, 0); err != nil {
-			t.Fatalf("Create failed: %v", err)
-		}
+	bar := &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "bar"}}
+	barKey := computePodKey(bar)
+	if err := store.Create(ctx, barKey, bar, nil, 0); err != nil {
+		t.Fatalf("Create failed: %v", err)
 	}
+	barSize := objectSize(t, codec, bar, transformer)
+	assertStats(t, store, sizeEnabled, storage.Stats{ObjectCount: 2, EstimatedAverageObjectSizeBytes: (fooSize + barSize) / 2})
 
-	resourceACountGot, err := store.Count(resourceA)
+	if err := store.GuaranteedUpdate(ctx, barKey, bar, false, nil,
+		storage.SimpleUpdate(func(obj runtime.Object) (runtime.Object, error) {
+			pod := obj.(*example.Pod)
+			pod.Labels = map[string]string{"foo": "bar"}
+			return pod, nil
+		}), nil); err != nil {
+		t.Errorf("Update failed: %v", err)
+	}
+	// ResourceVerson is not stored.
+	bar.ResourceVersion = ""
+	barSize = objectSize(t, codec, bar, transformer)
+	assertStats(t, store, sizeEnabled, storage.Stats{ObjectCount: 2, EstimatedAverageObjectSizeBytes: (fooSize + barSize) / 2})
+
+	if err := store.Delete(ctx, fooKey, foo, nil, storage.ValidateAllObjectFunc, nil, storage.DeleteOptions{}); err != nil {
+		t.Errorf("Delete failed: %v", err)
+	}
+	assertStats(t, store, sizeEnabled, storage.Stats{ObjectCount: 1, EstimatedAverageObjectSizeBytes: barSize})
+
+	if err := store.Delete(ctx, fooKey, foo, nil, storage.ValidateAllObjectFunc, nil, storage.DeleteOptions{}); err == nil {
+		t.Errorf("Delete expected to fail")
+	}
+	assertStats(t, store, sizeEnabled, storage.Stats{ObjectCount: 1, EstimatedAverageObjectSizeBytes: barSize})
+
+	if err := store.Delete(ctx, barKey, bar, nil, storage.ValidateAllObjectFunc, nil, storage.DeleteOptions{}); err != nil {
+		t.Errorf("Delete failed: %v", err)
+	}
+	assertStats(t, store, sizeEnabled, storage.Stats{ObjectCount: 0, EstimatedAverageObjectSizeBytes: 0})
+}
+
+func assertStats(t *testing.T, store storage.Interface, sizeEnabled bool, expectStats storage.Stats) {
+	t.Helper()
+	// Execute consistent LIST to refresh state of cache.
+	err := store.GetList(t.Context(), "/pods", storage.ListOptions{Recursive: true, Predicate: storage.Everything}, &example.PodList{})
 	if err != nil {
-		t.Fatalf("store.Count failed: %v", err)
+		t.Fatalf("GetList failed: %v", err)
+	}
+	stats, err := store.Stats(t.Context())
+	if err != nil {
+		t.Fatalf("store.Stats failed: %v", err)
 	}
 
-	// count for resourceA should not include the objects for resourceB
-	// even though resourceA is a prefix of resourceB.
-	if int64(resourceACountExpected) != resourceACountGot {
-		t.Fatalf("store.Count for resource %s: expected %d but got %d", resourceA, resourceACountExpected, resourceACountGot)
+	if !sizeEnabled {
+		expectStats.EstimatedAverageObjectSizeBytes = 0
 	}
+	if expectStats != stats {
+		t.Errorf("store.Stats: expected %+v but got %+v", expectStats, stats)
+	}
+}
+
+func objectSize(t *testing.T, codec runtime.Codec, obj runtime.Object, transformer value.Transformer) int64 {
+	data, err := runtime.Encode(codec, obj)
+	if err != nil {
+		t.Fatalf("Encode failed: %v", err)
+	}
+	data, err = transformer.TransformToStorage(t.Context(), data, value.DefaultContext{})
+	if err != nil {
+		t.Fatalf("Transform failed: %v", err)
+	}
+	return int64(len(data))
 }
 
 func RunTestListPaging(ctx context.Context, t *testing.T, store storage.Interface) {

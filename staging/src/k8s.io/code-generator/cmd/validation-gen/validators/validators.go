@@ -17,8 +17,11 @@ limitations under the License.
 package validators
 
 import (
+	"fmt"
+
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/gengo/v2/codetags"
 	"k8s.io/gengo/v2/generator"
 	"k8s.io/gengo/v2/types"
 )
@@ -36,7 +39,7 @@ type TagValidator interface {
 	ValidScopes() sets.Set[Scope]
 
 	// GetValidations returns any validations described by this tag.
-	GetValidations(context Context, args []string, payload string) (Validations, error)
+	GetValidations(context Context, tag codetags.Tag) (Validations, error)
 
 	// Docs returns user-facing documentation for this tag.
 	Docs() TagDoc
@@ -133,25 +136,21 @@ type Context struct {
 	Scope Scope
 
 	// Type provides details about the type being validated.  When Scope is
-	// ScopeType, this is the underlying type.  When Scope is ScopeField, this
-	// is the field's type (including any pointerness).  When Scope indicates a
-	// list-value, map-key, or map-value, this is the type of that key or
-	// value.
+	// ScopeType, this is the newly defined type.  When Scope is ScopeField,
+	// this is the field's type (which may be a pointer, an alias, or both).
+	// When Scope indicates a list-value, map-key, or map-value, this is the
+	// type of that key or value (which, again, may be a pointer, and alias, or
+	// both).
 	Type *types.Type
 
-	// Parent provides details about the logical parent type of the type being
-	// validated, when applicable.  When Scope is ScopeType, this is the
-	// newly-defined type (when it exists - gengo handles struct-type
-	// definitions differently that other "alias" type definitions).  When
-	// Scope is ScopeField, this is the field's parent struct's type.  When
-	// Scope indicates a list-value, map-key, or map-value, this is the type of
-	// the whole list or map.
-	//
-	// Because of how gengo handles struct-type definitions, this field may be
-	// nil in those cases.
+	// Parent provides details about the logical parent type of the object
+	// being validated, when applicable.  When Scope is ScopeField, this is the
+	// containing struct's type.  When Scope indicates a list-value, map-key,
+	// or map-value, this is the type of the whole list or map. When Scope is
+	// ScopeType, this is nil.
 	Parent *types.Type
 
-	// Member provides details about a field within a struct, when Scope is
+	// Member provides details about a field within a struct when Scope is
 	// ScopeField.  For all other values of Scope, this will be nil.
 	Member *types.Member
 
@@ -179,40 +178,92 @@ type TagDoc struct {
 	// never has a payload, this list should be empty, but if the payload is
 	// optional, this list should include an entry for "<none>".
 	Payloads []TagPayloadDoc
+	// PayloadsType is the type of the payloads.
+	PayloadsType codetags.ValueType
+	// PayloadsRequired is true if a payload is required.
+	PayloadsRequired bool
 }
 
-// TagArgDoc describes an argument for a tag (e.g. `+tagName(tagArg)`.
+func (td TagDoc) Arg(name string) (TagArgDoc, bool) {
+	for _, arg := range td.Args {
+		if arg.Name == name {
+			return arg, true
+		}
+	}
+	return TagArgDoc{}, false
+}
+
+// TagArgDoc describes an argument for a tag.
+//
+// For example,
+//
+//	`+tagName(arg)`
+//	`+tagName(name1: arg1, name2: arg2)`
 type TagArgDoc struct {
+	// Name of this arg. Not provided for positional args.
+	Name string
 	// Description is a short description of this arg (e.g. `<name>`).
 	Description string
+	// Type is the type of the arg.
+	Type codetags.ArgType
+	// Required is true if the argument is required.
+	Required bool
+	// Default is the effective value if no value is provided.
+	Default string
+	// Docs is a human-oriented string explaining this arg.
+	Docs string
 }
 
 // TagPayloadDoc describes a value for a tag (e.g. `+tagName=tagValue`).  Some
-// tags upport multiple payloads, including <none> (e.g. `+tagName`).
+// tags support multiple payloads, including <none> (e.g. `+tagName`).
 type TagPayloadDoc struct {
 	// Description is a short description of this payload (e.g. `<number>`).
 	Description string
-	// Docs is a human-orientd string explaining this payload.
+	// Docs is a human-oriented string explaining this payload.
 	Docs string
-	// Schema details a JSON payload's contents.
-	Schema []TagPayloadSchema
 }
 
-// TagPayloadSchema describes a JSON tag payload.
-type TagPayloadSchema struct {
-	Key     string
-	Value   string
-	Docs    string
-	Default string
-}
-
-// Validations defines the function calls and variables to generate to perform validation.
+// Validations define the function calls and variables to generate to perform
+// validation.
 type Validations struct {
-	Functions     []FunctionGen
-	Variables     []VariableGen
-	Comments      []string
-	OpaqueType    bool
+	// Functions hold the function calls that should be generated to perform
+	// validation.  These functions may not be called in order - they may be
+	// sorted based on their flags and other criteria.
+	//
+	// Each function's signature must be of the form:
+	//   func(
+	//        // standard arguments
+	//        ctx context.Context
+	//        op operation.Operation,
+	//        fldPath field.Path,
+	//        value, oldValue <ValueType>, // always nilable
+	//        // additional arguments (optional)
+	//        Args[0] <Args[0]Type>,
+	//        Args[1] <Args[1]Type>,
+	//        ...
+	//        Args[N] <Args[N]Type>)
+	//
+	// The standard arguments are not included in the FunctionGen.Args list.
+	Functions []FunctionGen
+
+	// Variables hold any variables which must be generated to perform
+	// validation.  Variables are not permitted in every context.
+	Variables []VariableGen
+
+	// Comments holds comments to emit (without the leading "//").
+	Comments []string
+
+	// OpaqueType indicates that the type being validated is opaque, and that
+	// any validations defined on it should not be emitted.
+	OpaqueType bool
+
+	// OpaqueKeyType indicates that the key type of a map being validated is
+	// opaque, and that any validations defined on it should not be emitted.
 	OpaqueKeyType bool
+
+	// OpaqueValType indicates that the key type of a map or slice being
+	// validated is opaque, and that any validations defined on it should not
+	// be emitted.
 	OpaqueValType bool
 }
 
@@ -224,12 +275,12 @@ func (v *Validations) Len() int {
 	return len(v.Functions) + len(v.Variables) + len(v.Comments)
 }
 
-func (v *Validations) AddFunction(f FunctionGen) {
-	v.Functions = append(v.Functions, f)
+func (v *Validations) AddFunction(fn FunctionGen) {
+	v.Functions = append(v.Functions, fn)
 }
 
-func (v *Validations) AddVariable(variable VariableGen) {
-	v.Variables = append(v.Variables, variable)
+func (v *Validations) AddVariable(vr VariableGen) {
+	v.Variables = append(v.Variables, vr)
 }
 
 func (v *Validations) AddComment(comment string) {
@@ -268,42 +319,6 @@ const (
 	NonError
 )
 
-// FunctionGen provides validation-gen with the information needed to generate a
-// validation function invocation.
-type FunctionGen interface {
-	// TagName returns the tag which triggers this validator.
-	TagName() string
-
-	// SignatureAndArgs returns the function name and all extraArg value literals that are passed when the function
-	// invocation is generated.
-	//
-	// The function signature must be of the form:
-	//   func(op operation.Operation,
-	//        fldPath field.Path,
-	//        value, oldValue <ValueType>,     // always nilable
-	//        extraArgs[0] <extraArgs[0]Type>, // optional
-	//        ...,
-	//        extraArgs[N] <extraArgs[N]Type>)
-	//
-	// extraArgs may contain:
-	// - data literals comprised of maps, slices, strings, ints, floats and bools
-	// - references, represented by types.Type (to reference any type in the universe), and types.Member (to reference members of the current value)
-	//
-	// If validation function to be called does not have a signature of this form, please introduce
-	// a function that does and use that function to call the validation function.
-	SignatureAndArgs() (function types.Name, extraArgs []any)
-
-	// TypeArgs assigns types to the type parameters of the function, for invocation.
-	TypeArgs() []types.Name
-
-	// Flags returns the options for this validator function.
-	Flags() FunctionFlags
-
-	// Conditions returns the conditions that must true for a resource to be
-	// validated by this function.
-	Conditions() Conditions
-}
-
 // Conditions defines what conditions must be true for a resource to be validated.
 // If any of the conditions are not true, the resource is not validated.
 type Conditions struct {
@@ -326,92 +341,85 @@ type Identifier types.Name
 // PrivateVars are generated using the PrivateNamer strategy.
 type PrivateVar types.Name
 
-// VariableGen provides validation-gen with the information needed to generate variable.
-// Variables typically support generated functions by providing static information such
-// as the list of supported symbols for an enum.
-type VariableGen interface {
-	// TagName returns the tag which triggers this validator.
-	TagName() string
-
-	// Var returns the variable identifier.
-	Var() PrivateVar
-
-	// Init generates the function call that the variable is assigned to.
-	Init() FunctionGen
-}
-
 // Function creates a FunctionGen for a given function name and extraArgs.
 func Function(tagName string, flags FunctionFlags, function types.Name, extraArgs ...any) FunctionGen {
-	return GenericFunction(tagName, flags, function, nil, extraArgs...)
-}
-
-func GenericFunction(tagName string, flags FunctionFlags, function types.Name, typeArgs []types.Name, extraArgs ...any) FunctionGen {
-	// Callers of Signature don't care if the args are all of a known type, it just
-	// makes it easier to declare validators.
-	var anyArgs []any
-	if len(extraArgs) > 0 {
-		anyArgs = make([]any, len(extraArgs))
-		copy(anyArgs, extraArgs)
-	}
-	return &functionGen{tagName: tagName, flags: flags, function: function, extraArgs: anyArgs, typeArgs: typeArgs}
-}
-
-func WithCondition(fn FunctionGen, conditions Conditions) FunctionGen {
-	name, args := fn.SignatureAndArgs()
-	return &functionGen{
-		tagName: fn.TagName(), flags: fn.Flags(), function: name, extraArgs: args, typeArgs: fn.TypeArgs(),
-		conditions: conditions,
+	return FunctionGen{
+		TagName:  tagName,
+		Flags:    flags,
+		Function: function,
+		Args:     extraArgs,
 	}
 }
 
-type functionGen struct {
-	tagName    string
-	function   types.Name
-	extraArgs  []any
-	typeArgs   []types.Name
-	flags      FunctionFlags
-	conditions Conditions
+// FunctionGen describes a function call that should be generated.
+type FunctionGen struct {
+	// TagName is the tag which triggered this function.
+	TagName string
+
+	// Flags holds the options for this validator function.
+	Flags FunctionFlags
+
+	// Function is the name of the function to call.
+	Function types.Name
+
+	// Args holds arguments to pass to the function, and may conatin:
+	// - data literals comprised of maps, slices, strings, ints, floats, and bools
+	// - types.Type (to reference any type in the universe)
+	// - types.Member (to reference members of the current value)
+	// - types.Identifier (to reference any identifier in the universe)
+	// - validators.WrapperFunction (to call another validation function)
+	// - validators.Literal (to pass a literal value)
+	// - validators.FunctionLiteral (to pass a function literal)
+	// - validators.PrivateVar (to reference a variable)
+	//
+	// See toGolangSourceDataLiteral for details.
+	Args []any
+
+	// TypeArgs assigns types to the type parameters of the function, for
+	// generic function calls which require explicit type arguments.
+	TypeArgs []types.Name
+
+	// Conditions holds any conditions that must true for a field to be
+	// validated by this function.
+	Conditions Conditions
+
+	// Comments holds optional comments that should be added to the generated
+	// code (without the leading "//").
+	Comments []string
 }
 
-func (v *functionGen) TagName() string {
-	return v.tagName
+// WithTypeArgs returns a derived FunctionGen with type arguments.
+func (fg FunctionGen) WithTypeArgs(typeArgs ...types.Name) FunctionGen {
+	fg.TypeArgs = typeArgs
+	return fg
 }
 
-func (v *functionGen) SignatureAndArgs() (function types.Name, args []any) {
-	return v.function, v.extraArgs
+// WithConditions returns a derived FunctionGen with conditions.
+func (fg FunctionGen) WithConditions(conditions Conditions) FunctionGen {
+	fg.Conditions = conditions
+	return fg
 }
 
-func (v *functionGen) TypeArgs() []types.Name { return v.typeArgs }
-
-func (v *functionGen) Flags() FunctionFlags {
-	return v.flags
+// WithComment returns a new FunctionGen with a comment.
+func (fg FunctionGen) WithComment(comment string) FunctionGen {
+	fg.Comments = append(fg.Comments, comment)
+	return fg
 }
-
-func (v *functionGen) Conditions() Conditions { return v.conditions }
 
 // Variable creates a VariableGen for a given function name and extraArgs.
-func Variable(variable PrivateVar, init FunctionGen) VariableGen {
-	return &variableGen{
-		variable: variable,
-		init:     init,
+func Variable(variable PrivateVar, initFunc FunctionGen) VariableGen {
+	return VariableGen{
+		Variable: variable,
+		InitFunc: initFunc,
 	}
 }
 
-type variableGen struct {
-	variable PrivateVar
-	init     FunctionGen
-}
+type VariableGen struct {
+	// Variable holds the variable identifier.
+	Variable PrivateVar
 
-func (v variableGen) TagName() string {
-	return v.init.TagName()
-}
-
-func (v variableGen) Var() PrivateVar {
-	return v.variable
-}
-
-func (v variableGen) Init() FunctionGen {
-	return v.init
+	// InitFunc describes the function call that the variable is assigned to.
+	InitFunc FunctionGen
 }
 
 // WrapperFunction describes a function literal which has the fingerprint of a
@@ -440,4 +448,43 @@ type FunctionLiteral struct {
 type ParamResult struct {
 	Name string
 	Type *types.Type
+}
+
+// typeCheck checks that the argument and value types of the tag match the types
+// declared in the doc.
+func typeCheck(tag codetags.Tag, doc TagDoc) error {
+	for _, docArg := range doc.Args {
+		hasArg := false
+		for _, tagArg := range tag.Args {
+			if tagArg.Name == docArg.Name {
+				hasArg = true
+				if docArg.Type != tagArg.Type {
+					return fmt.Errorf("argument %q has wrong type: got %s, want %s",
+						tagArg, tagArg.Type, docArg.Type)
+				}
+				break
+			}
+		}
+		if !hasArg && docArg.Required {
+			if docArg.Name == "" {
+				return fmt.Errorf("missing required positional argument of type %s", docArg.Type)
+			} else {
+				return fmt.Errorf("missing named argument %q of type %s", docArg.Name, docArg.Type)
+			}
+		}
+	}
+
+	for _, tagArg := range tag.Args {
+		if _, ok := doc.Arg(tagArg.Name); !ok {
+			return fmt.Errorf("unrecognized named argument %q", tagArg)
+		}
+	}
+	if tag.ValueType == codetags.ValueTypeNone {
+		if doc.PayloadsRequired {
+			return fmt.Errorf("missing required tag value of type %s", doc.PayloadsType)
+		}
+	} else if tag.ValueType != doc.PayloadsType {
+		return fmt.Errorf("tag value has wrong type: got %s, want %s", tag.ValueType, doc.PayloadsType)
+	}
+	return nil
 }

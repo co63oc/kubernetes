@@ -21,10 +21,9 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
-
-	"github.com/pkg/errors"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
@@ -36,6 +35,7 @@ import (
 	"k8s.io/kubernetes/cmd/kubeadm/app/images"
 	certphase "k8s.io/kubernetes/cmd/kubeadm/app/phases/certs"
 	kubeadmutil "k8s.io/kubernetes/cmd/kubeadm/app/util"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/errors"
 	staticpodutil "k8s.io/kubernetes/cmd/kubeadm/app/util/staticpod"
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/users"
 )
@@ -295,12 +295,7 @@ func isValidAuthzMode(authzMode string) bool {
 		kubeadmconstants.ModeAlwaysDeny,
 	}
 
-	for _, mode := range allModes {
-		if authzMode == mode {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(allModes, authzMode)
 }
 
 // getControllerManagerCommand builds the right controller manager command from the given config object and version

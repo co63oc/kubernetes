@@ -36,6 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/rand"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -83,6 +84,16 @@ const (
 	// The number of batches is given by:
 	//      1+floor(log_2(ceil(N/SlowStartInitialBatchSize)))
 	SlowStartInitialBatchSize = 1
+
+	// PodNodeNameKeyIndex is the name of the index used by PodInformer to index pods by their node name.
+	PodNodeNameKeyIndex = "spec.nodeName"
+
+	// OrphanPodIndexKey is used to index all Orphan pods to this key
+	OrphanPodIndexKey = "_ORPHAN_POD"
+
+	// podControllerUIDIndex is the name for the Pod store's index function,
+	// which is to index by pods's controllerUID.
+	PodControllerUIDIndex = "podControllerUID"
 )
 
 var UpdateTaintBackoff = wait.Backoff{
@@ -1049,6 +1060,80 @@ func FilterReplicaSets(RSes []*apps.ReplicaSet, filterFn filterRS) []*apps.Repli
 		}
 	}
 	return filtered
+}
+
+// AddPodNodeNameIndexer adds an indexer for Pod's nodeName to the given PodInformer.
+// This indexer is used to efficiently look up pods by their node name.
+func AddPodNodeNameIndexer(podInformer cache.SharedIndexInformer) error {
+	if _, exists := podInformer.GetIndexer().GetIndexers()[PodNodeNameKeyIndex]; exists {
+		// indexer already exists, do nothing
+		return nil
+	}
+
+	return podInformer.AddIndexers(cache.Indexers{
+		PodNodeNameKeyIndex: func(obj interface{}) ([]string, error) {
+			pod, ok := obj.(*v1.Pod)
+			if !ok {
+				return []string{}, nil
+			}
+			if len(pod.Spec.NodeName) == 0 {
+				return []string{}, nil
+			}
+			return []string{pod.Spec.NodeName}, nil
+		},
+	})
+}
+
+// OrphanPodIndexKeyForNamespace returns the orphan pod index key for a specific namespace.
+func OrphanPodIndexKeyForNamespace(namespace string) string {
+	return OrphanPodIndexKey + "/" + namespace
+}
+
+// AddPodControllerUIDIndexer adds an indexer for Pod's controllerRef.UID to the given PodInformer.
+// This indexer is used to efficiently look up pods by their ControllerRef.UID
+func AddPodControllerUIDIndexer(podInformer cache.SharedIndexInformer) error {
+	if _, exists := podInformer.GetIndexer().GetIndexers()[PodControllerUIDIndex]; exists {
+		// indexer already exists, do nothing
+		return nil
+	}
+	return podInformer.AddIndexers(cache.Indexers{
+		PodControllerUIDIndex: func(obj interface{}) ([]string, error) {
+			pod, ok := obj.(*v1.Pod)
+			if !ok {
+				return nil, nil
+			}
+			// Get the ControllerRef of the Pod to check if it's managed by a controller
+			if ref := metav1.GetControllerOf(pod); ref != nil {
+				return []string{string(ref.UID)}, nil
+			}
+			// If the Pod has no controller (i.e., it's orphaned), index it with the OrphanPodIndexKeyForNamespace
+			// This helps identify orphan pods for reconciliation and adoption by controllers
+			return []string{OrphanPodIndexKeyForNamespace(pod.Namespace)}, nil
+		},
+	})
+}
+
+// FilterPodsByOwner gets the Pods managed by an owner or orphan Pods in the owner's namespace
+func FilterPodsByOwner(podIndexer cache.Indexer, owner *metav1.ObjectMeta) ([]*v1.Pod, error) {
+	result := []*v1.Pod{}
+	// Iterate over two keys:
+	// - the UID of the owner, which identifies Pods that are controlled by the owner
+	// - the OrphanPodIndexKey, which identifies orphaned Pods in the owner's namespace and might be adopted by the owner later
+	for _, key := range []string{string(owner.UID), OrphanPodIndexKeyForNamespace(owner.Namespace)} {
+		pods, err := podIndexer.ByIndex(PodControllerUIDIndex, key)
+		if err != nil {
+			return nil, err
+		}
+		for _, obj := range pods {
+			pod, ok := obj.(*v1.Pod)
+			if !ok {
+				utilruntime.HandleError(fmt.Errorf("unexpected object type in pod indexer: %v", obj))
+				continue
+			}
+			result = append(result, pod)
+		}
+	}
+	return result, nil
 }
 
 // PodKey returns a key unique to the given pod within a cluster.

@@ -33,11 +33,13 @@ import (
 	"google.golang.org/grpc/status"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	internalapi "k8s.io/cri-api/pkg/apis"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 	"k8s.io/klog/v2"
 	statsapi "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 	kubetypes "k8s.io/kubelet/pkg/types"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/cadvisor"
 	"k8s.io/kubernetes/pkg/kubelet/server/stats"
 	"k8s.io/utils/clock"
@@ -211,6 +213,7 @@ func (p *criStatsProvider) listPodStatsPartiallyFromCRI(ctx context.Context, upd
 		p.addPodNetworkStats(ps, podSandboxID, caInfos, cs, containerNetworkStats[podSandboxID])
 		p.addPodCPUMemoryStats(ps, types.UID(podSandbox.Metadata.Uid), allInfos, cs)
 		p.addSwapStats(ps, types.UID(podSandbox.Metadata.Uid), allInfos, cs)
+		p.addIOStats(ps, types.UID(podSandbox.Metadata.Uid), allInfos, cs)
 
 		// If cadvisor stats is available for the container, use it to populate
 		// container stats
@@ -260,6 +263,7 @@ func (p *criStatsProvider) listPodStatsStrictlyFromCRI(ctx context.Context, upda
 		addCRIPodCPUStats(ps, criSandboxStat)
 		addCRIPodMemoryStats(ps, criSandboxStat)
 		addCRIPodProcessStats(ps, criSandboxStat)
+		addCRIPodIOStats(ps, criSandboxStat)
 		makePodStorageStats(ps, rootFsInfo, p.resourceAnalyzer, p.hostStatsProvider, true)
 		summarySandboxStats = append(summarySandboxStats, *ps)
 	}
@@ -339,6 +343,7 @@ func (p *criStatsProvider) ListPodCPUAndMemoryStats(ctx context.Context) ([]stat
 		// Fill available CPU and memory stats for full set of required pod stats
 		cs := p.makeContainerCPUAndMemoryStats(stats, container)
 		p.addPodCPUMemoryStats(ps, types.UID(podSandbox.Metadata.Uid), allInfos, cs)
+		p.addSwapStats(ps, types.UID(podSandbox.Metadata.Uid), allInfos, cs)
 
 		// If cadvisor stats is available for the container, use it to populate
 		// container stats
@@ -535,6 +540,7 @@ func (p *criStatsProvider) addPodCPUMemoryStats(
 		usageNanoCores := getUint64Value(cs.CPU.UsageNanoCores) + getUint64Value(ps.CPU.UsageNanoCores)
 		ps.CPU.UsageCoreNanoSeconds = &usageCoreNanoSeconds
 		ps.CPU.UsageNanoCores = &usageNanoCores
+		// Pod level PSI stats cannot be calculated from container level
 	}
 
 	if cs.Memory != nil {
@@ -555,6 +561,7 @@ func (p *criStatsProvider) addPodCPUMemoryStats(
 		ps.Memory.RSSBytes = &rSSBytes
 		ps.Memory.PageFaults = &pageFaults
 		ps.Memory.MajorPageFaults = &majorPageFaults
+		// Pod level PSI stats cannot be calculated from container level
 	}
 }
 
@@ -564,14 +571,14 @@ func (p *criStatsProvider) addSwapStats(
 	allInfos map[string]cadvisorapiv2.ContainerInfo,
 	cs *statsapi.ContainerStats,
 ) {
-	// try get cpu and memory stats from cadvisor first.
+	// try get swap stats from cadvisor first.
 	podCgroupInfo := getCadvisorPodInfoFromPodUID(podUID, allInfos)
 	if podCgroupInfo != nil {
 		ps.Swap = cadvisorInfoToSwapStats(podCgroupInfo)
 		return
 	}
 
-	// Sum Pod cpu and memory stats from containers stats.
+	// Sum Pod swap stats from containers stats.
 	if cs.Swap != nil {
 		if ps.Swap == nil {
 			ps.Swap = &statsapi.SwapStats{Time: cs.Swap.Time}
@@ -580,6 +587,30 @@ func (p *criStatsProvider) addSwapStats(
 		swapUsageBytes := getUint64Value(cs.Swap.SwapUsageBytes) + getUint64Value(ps.Swap.SwapUsageBytes)
 		ps.Swap.SwapAvailableBytes = &swapAvailableBytes
 		ps.Swap.SwapUsageBytes = &swapUsageBytes
+	}
+}
+
+func (p *criStatsProvider) addIOStats(
+	ps *statsapi.PodStats,
+	podUID types.UID,
+	allInfos map[string]cadvisorapiv2.ContainerInfo,
+	cs *statsapi.ContainerStats,
+) {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.KubeletPSI) {
+		return
+	}
+	// try get IO stats from cadvisor first.
+	podCgroupInfo := getCadvisorPodInfoFromPodUID(podUID, allInfos)
+	if podCgroupInfo != nil {
+		ps.IO = cadvisorInfoToIOStats(podCgroupInfo)
+		return
+	}
+
+	if cs.IO != nil {
+		if ps.IO == nil {
+			ps.IO = &statsapi.IOStats{Time: cs.IO.Time}
+		}
+		// Pod level PSI stats cannot be calculated from container level
 	}
 }
 
@@ -624,6 +655,7 @@ func (p *criStatsProvider) makeContainerStats(
 		if usageNanoCores != nil {
 			result.CPU.UsageNanoCores = usageNanoCores
 		}
+		result.CPU.PSI = makePSIStats(stats.Cpu.Psi)
 	} else {
 		result.CPU.Time = metav1.NewTime(time.Unix(0, time.Now().UnixNano()))
 		result.CPU.UsageCoreNanoSeconds = uint64Ptr(0)
@@ -634,6 +666,7 @@ func (p *criStatsProvider) makeContainerStats(
 		if stats.Memory.WorkingSetBytes != nil {
 			result.Memory.WorkingSetBytes = &stats.Memory.WorkingSetBytes.Value
 		}
+		result.Memory.PSI = makePSIStats(stats.Memory.Psi)
 	} else {
 		result.Memory.Time = metav1.NewTime(time.Unix(0, time.Now().UnixNano()))
 		result.Memory.WorkingSetBytes = uint64Ptr(0)
@@ -650,6 +683,15 @@ func (p *criStatsProvider) makeContainerStats(
 		result.Swap.Time = metav1.NewTime(time.Unix(0, time.Now().UnixNano()))
 		result.Swap.SwapUsageBytes = uint64Ptr(0)
 		result.Swap.SwapAvailableBytes = uint64Ptr(0)
+	}
+	if utilfeature.DefaultFeatureGate.Enabled(features.KubeletPSI) {
+		result.IO = &statsapi.IOStats{}
+		if stats.Io != nil {
+			result.IO.Time = metav1.NewTime(time.Unix(0, stats.Io.Timestamp))
+			result.IO.PSI = makePSIStats(stats.Io.Psi)
+		} else {
+			result.IO.Time = metav1.NewTime(time.Unix(0, time.Now().UnixNano()))
+		}
 	}
 	if stats.WritableLayer != nil {
 		result.Rootfs.Time = metav1.NewTime(time.Unix(0, stats.WritableLayer.Timestamp))
@@ -702,6 +744,11 @@ func (p *criStatsProvider) makeContainerCPUAndMemoryStats(
 		StartTime: metav1.NewTime(time.Unix(0, container.CreatedAt)),
 		CPU:       &statsapi.CPUStats{},
 		Memory:    &statsapi.MemoryStats{},
+		Swap: &statsapi.SwapStats{
+			Time:               metav1.NewTime(time.Unix(0, time.Now().UnixNano())),
+			SwapUsageBytes:     uint64Ptr(0),
+			SwapAvailableBytes: uint64Ptr(0),
+		},
 		// UserDefinedMetrics is not supported by CRI.
 	}
 	if stats.Cpu != nil {
@@ -714,6 +761,7 @@ func (p *criStatsProvider) makeContainerCPUAndMemoryStats(
 		if usageNanoCores != nil {
 			result.CPU.UsageNanoCores = usageNanoCores
 		}
+		result.CPU.PSI = makePSIStats(stats.Cpu.Psi)
 	} else {
 		result.CPU.Time = metav1.NewTime(time.Unix(0, time.Now().UnixNano()))
 		result.CPU.UsageCoreNanoSeconds = uint64Ptr(0)
@@ -724,11 +772,48 @@ func (p *criStatsProvider) makeContainerCPUAndMemoryStats(
 		if stats.Memory.WorkingSetBytes != nil {
 			result.Memory.WorkingSetBytes = &stats.Memory.WorkingSetBytes.Value
 		}
+		result.Memory.PSI = makePSIStats(stats.Memory.Psi)
 	} else {
 		result.Memory.Time = metav1.NewTime(time.Unix(0, time.Now().UnixNano()))
 		result.Memory.WorkingSetBytes = uint64Ptr(0)
 	}
+	if stats.Swap != nil {
+		result.Swap.Time = metav1.NewTime(time.Unix(0, stats.Swap.Timestamp))
+		if stats.Swap.SwapUsageBytes != nil {
+			result.Swap.SwapUsageBytes = &stats.Swap.SwapUsageBytes.Value
+		}
+		if stats.Swap.SwapAvailableBytes != nil {
+			result.Swap.SwapAvailableBytes = &stats.Swap.SwapAvailableBytes.Value
+		}
+	}
 
+	return result
+}
+
+func makePSIStats(stats *runtimeapi.PsiStats) *statsapi.PSIStats {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.KubeletPSI) {
+		return nil
+	}
+	if stats == nil {
+		return nil
+	}
+	result := &statsapi.PSIStats{}
+	if stats.Full != nil {
+		result.Full = statsapi.PSIData{
+			Total:  stats.Full.Total,
+			Avg10:  stats.Full.Avg10,
+			Avg60:  stats.Full.Avg60,
+			Avg300: stats.Full.Avg300,
+		}
+	}
+	if stats.Some != nil {
+		result.Some = statsapi.PSIData{
+			Total:  stats.Some.Total,
+			Avg10:  stats.Some.Avg10,
+			Avg60:  stats.Some.Avg60,
+			Avg300: stats.Some.Avg300,
+		}
+	}
 	return result
 }
 
@@ -909,6 +994,13 @@ func (p *criStatsProvider) addCadvisorContainerStats(
 	swap := cadvisorInfoToSwapStats(caPodStats)
 	if swap != nil {
 		cs.Swap = swap
+	}
+
+	if utilfeature.DefaultFeatureGate.Enabled(features.KubeletPSI) {
+		io := cadvisorInfoToIOStats(caPodStats)
+		if io != nil {
+			cs.IO = io
+		}
 	}
 }
 

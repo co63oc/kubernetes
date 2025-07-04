@@ -4459,6 +4459,53 @@ func TestValidateCustomResourceDefinition(t *testing.T) {
 				invalid("spec", "validation", "openAPIV3Schema", "x-kubernetes-validations[4]", "fieldPath"),
 			},
 		},
+		{
+			name: "valid name printer column formats",
+			resource: &apiextensions.CustomResourceDefinition{
+				ObjectMeta: metav1.ObjectMeta{Name: "plural.group.com"},
+				Spec: apiextensions.CustomResourceDefinitionSpec{
+					Group: "group.com",
+					Scope: apiextensions.ResourceScope("Cluster"),
+					Names: apiextensions.CustomResourceDefinitionNames{
+						Plural:   "plural",
+						Singular: "singular",
+						Kind:     "Plural",
+						ListKind: "PluralList",
+					},
+					Versions: []apiextensions.CustomResourceDefinitionVersion{{Name: "version", Served: true, Storage: true}},
+					Validation: &apiextensions.CustomResourceValidation{
+						OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+							Type: "object",
+							Properties: map[string]apiextensions.JSONSchemaProps{
+								"shortName": {Type: "string", Format: "k8s-short-name"},
+								"longName":  {Type: "string", Format: "k8s-long-name"},
+							},
+						},
+					},
+					AdditionalPrinterColumns: []apiextensions.CustomResourceColumnDefinition{
+						{
+							Name:     "primaryName",
+							Type:     "string",
+							JSONPath: ".metadata.name",
+						},
+						{
+							Name:     "shortName",
+							Type:     "string",
+							JSONPath: ".spec.shortName",
+						},
+						{
+							Name:     "longName",
+							Type:     "string",
+							JSONPath: ".spec.longName",
+						},
+					},
+					PreserveUnknownFields: pointer.BoolPtr(false),
+				},
+				Status: apiextensions.CustomResourceDefinitionStatus{
+					StoredVersions: []string{"version"},
+				},
+			},
+		},
 	}
 
 	for _, tc := range tests {
@@ -10948,7 +10995,7 @@ func TestSchemaHasDefaults(t *testing.T) {
 	for i := 0; i < 10000; i++ {
 		// fuzz internal types
 		schema := &apiextensions.JSONSchemaProps{}
-		f.Fuzz(schema)
+		f.Fill(schema)
 
 		v1beta1Schema := &apiextensionsv1beta1.JSONSchemaProps{}
 		if err := apiextensionsv1beta1.Convert_apiextensions_JSONSchemaProps_To_v1beta1_JSONSchemaProps(schema, v1beta1Schema, nil); err != nil {
@@ -10987,7 +11034,7 @@ func TestValidateCustomResourceDefinitionStoredVersions(t *testing.T) {
 			storageVersion: "v1",
 			storedVersions: []string{},
 			errors: []validationMatch{
-				invalid("status", "storedVersions").contains("Invalid value: []string{}: must have at least one stored version"),
+				invalid("status", "storedVersions").contains("Invalid value: []: must have at least one stored version"),
 			},
 		},
 		{
@@ -11011,7 +11058,7 @@ func TestValidateCustomResourceDefinitionStoredVersions(t *testing.T) {
 			storageVersion: "v1",
 			storedVersions: []string{"v1alpha", "v1beta1"},
 			errors: []validationMatch{
-				invalid("status", "storedVersions").contains("Invalid value: []string{\"v1alpha\", \"v1beta1\"}: must have the storage version v1"),
+				invalid("status", "storedVersions").contains("Invalid value: [\"v1alpha\",\"v1beta1\"]: must have the storage version v1"),
 			},
 		},
 	}
@@ -11072,7 +11119,7 @@ func BenchmarkSchemaHas(b *testing.B) {
 	f := fuzzer.FuzzerFor(fuzzerFuncs, rand.NewSource(seed), codecs)
 	// fuzz internal types
 	schema := &apiextensions.JSONSchemaProps{}
-	f.NilChance(0).NumElements(10, 10).MaxDepth(10).Fuzz(schema)
+	f.NilChance(0).NumElements(10, 10).MaxDepth(10).Fill(schema)
 
 	b.ReportAllocs()
 	b.ResetTimer()

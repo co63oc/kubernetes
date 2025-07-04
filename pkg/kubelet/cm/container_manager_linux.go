@@ -27,9 +27,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/opencontainers/runc/libcontainer/cgroups"
-	"github.com/opencontainers/runc/libcontainer/cgroups/manager"
-	"github.com/opencontainers/runc/libcontainer/configs"
+	"github.com/opencontainers/cgroups"
+	"github.com/opencontainers/cgroups/manager"
 	"k8s.io/klog/v2"
 	"k8s.io/mount-utils"
 	utilpath "k8s.io/utils/path"
@@ -132,8 +131,8 @@ type containerManagerImpl struct {
 	memoryManager memorymanager.Manager
 	// Interface for Topology resource co-ordination
 	topologyManager topologymanager.Manager
-	// Interface for Dynamic Resource Allocation management.
-	draManager dra.Manager
+	// Implementation of Dynamic Resource Allocation (DRA).
+	draManager *dra.Manager
 	// kubeClient is the interface to the Kubernetes API server. May be nil if the kubelet is running in standalone mode.
 	kubeClient clientset.Interface
 }
@@ -311,7 +310,7 @@ func NewContainerManager(mountUtil mount.Interface, cadvisorInterface cadvisor.I
 	// Initialize DRA manager
 	if utilfeature.DefaultFeatureGate.Enabled(kubefeatures.DynamicResourceAllocation) {
 		klog.InfoS("Creating Dynamic Resource Allocation (DRA) manager")
-		cm.draManager, err = dra.NewManagerImpl(kubeClient, nodeConfig.KubeletRootDir, nodeConfig.NodeName)
+		cm.draManager, err = dra.NewManager(kubeClient, nodeConfig.KubeletRootDir)
 		if err != nil {
 			return nil, err
 		}
@@ -388,10 +387,10 @@ func (cm *containerManagerImpl) InternalContainerLifecycle() InternalContainerLi
 
 // Create a cgroup container manager.
 func createManager(containerName string) (cgroups.Manager, error) {
-	cg := &configs.Cgroup{
+	cg := &cgroups.Cgroup{
 		Parent: "/",
 		Name:   containerName,
-		Resources: &configs.Resources{
+		Resources: &cgroups.Resources{
 			SkipDevices: true,
 		},
 		Systemd: false,

@@ -96,6 +96,7 @@ func (podStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
 
 	applySchedulingGatedCondition(pod)
 	mutatePodAffinity(pod)
+	mutateTopologySpreadConstraints(pod)
 	applyAppArmorVersionSkew(ctx, pod)
 }
 
@@ -226,6 +227,37 @@ func (podStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.
 	if newPod.Status.QOSClass == "" {
 		newPod.Status.QOSClass = oldPod.Status.QOSClass
 	}
+
+	preserveOldObservedGeneration(newPod, oldPod)
+	podutil.DropDisabledPodFields(newPod, oldPod)
+}
+
+// If a client request tries to clear `observedGeneration`, in the pod status or
+// conditions, we preserve the original value.
+func preserveOldObservedGeneration(newPod, oldPod *api.Pod) {
+	if newPod.Status.ObservedGeneration == 0 {
+		newPod.Status.ObservedGeneration = oldPod.Status.ObservedGeneration
+	}
+
+	// Remember observedGeneration values from old status conditions.
+	// This is a list per type because validation permits multiple conditions with the same type.
+	oldConditionGenerations := map[api.PodConditionType][]int64{}
+	for _, oldCondition := range oldPod.Status.Conditions {
+		oldConditionGenerations[oldCondition.Type] = append(oldConditionGenerations[oldCondition.Type], oldCondition.ObservedGeneration)
+	}
+
+	// For any conditions in the new status without observedGeneration set, preserve the old value.
+	for i, newCondition := range newPod.Status.Conditions {
+		oldGeneration := int64(0)
+		if oldGenerations, ok := oldConditionGenerations[newCondition.Type]; ok && len(oldGenerations) > 0 {
+			oldGeneration = oldGenerations[0]
+			oldConditionGenerations[newCondition.Type] = oldGenerations[1:]
+		}
+
+		if newCondition.ObservedGeneration == 0 {
+			newPod.Status.Conditions[i].ObservedGeneration = oldGeneration
+		}
+	}
 }
 
 func (podStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
@@ -239,7 +271,17 @@ func (podStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Ob
 
 // WarningsOnUpdate returns warnings for the given update.
 func (podStatusStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
-	return nil
+	pod := obj.(*api.Pod)
+	var warnings []string
+
+	for i, podIP := range pod.Status.PodIPs {
+		warnings = append(warnings, utilvalidation.GetWarningsForIP(field.NewPath("status", "podIPs").Index(i).Child("ip"), podIP.IP)...)
+	}
+	for i, hostIP := range pod.Status.HostIPs {
+		warnings = append(warnings, utilvalidation.GetWarningsForIP(field.NewPath("status", "hostIPs").Index(i).Child("ip"), hostIP.IP)...)
+	}
+
+	return warnings
 }
 
 type podEphemeralContainersStrategy struct {
@@ -363,7 +405,6 @@ func (podResizeStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.
 	oldPod := old.(*api.Pod)
 
 	*newPod = *dropNonResizeUpdates(newPod, oldPod)
-	podutil.MarkPodProposedForResize(oldPod, newPod)
 	podutil.DropDisabledPodFields(newPod, oldPod)
 	updatePodGeneration(newPod, oldPod)
 }
@@ -849,6 +890,25 @@ func mutatePodAffinity(pod *api.Pod) {
 		for i := range affinity.RequiredDuringSchedulingIgnoredDuringExecution {
 			applyMatchLabelKeysAndMismatchLabelKeys(&affinity.RequiredDuringSchedulingIgnoredDuringExecution[i], pod.Labels)
 		}
+	}
+}
+
+func applyMatchLabelKeys(constraint *api.TopologySpreadConstraint, labels map[string]string) {
+	if len(constraint.MatchLabelKeys) == 0 || constraint.LabelSelector == nil {
+		// If LabelSelector is nil, we don't need to apply label keys to it because nil-LabelSelector is match none.
+		return
+	}
+
+	applyLabelKeysToLabelSelector(constraint.LabelSelector, constraint.MatchLabelKeys, metav1.LabelSelectorOpIn, labels)
+}
+
+func mutateTopologySpreadConstraints(pod *api.Pod) {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.MatchLabelKeysInPodTopologySpread) || !utilfeature.DefaultFeatureGate.Enabled(features.MatchLabelKeysInPodTopologySpreadSelectorMerge) || pod.Spec.TopologySpreadConstraints == nil {
+		return
+	}
+	topologySpreadConstraints := pod.Spec.TopologySpreadConstraints
+	for i := range topologySpreadConstraints {
+		applyMatchLabelKeys(&topologySpreadConstraints[i], pod.Labels)
 	}
 }
 

@@ -17,7 +17,6 @@ limitations under the License.
 package validators
 
 import (
-	"k8s.io/gengo/v2/parser/tags"
 	"k8s.io/gengo/v2/types"
 )
 
@@ -27,25 +26,11 @@ const (
 	libValidationPkg = "k8s.io/apimachinery/pkg/api/validate"
 )
 
-func getMemberByJSON(t *types.Type, jsonName string) *types.Member {
-	for i := range t.Members {
-		if jsonTag, ok := tags.LookupJSON(t.Members[i]); ok {
-			if jsonTag.Name == jsonName {
-				return &t.Members[i]
-			}
-		}
+// rootTypeString returns a string representation of the relationship between
+// src and dst types, for use in error messages.
+func rootTypeString(src, dst *types.Type) string {
+	if src == dst {
+		return src.String()
 	}
-	return nil
-}
-
-// isNilableType returns true if the argument type can be compared to nil.
-func isNilableType(t *types.Type) bool {
-	for t.Kind == types.Alias {
-		t = t.Underlying
-	}
-	switch t.Kind {
-	case types.Pointer, types.Map, types.Slice, types.Interface: // Note: Arrays are not nilable
-		return true
-	}
-	return false
+	return src.String() + " -> " + dst.String()
 }

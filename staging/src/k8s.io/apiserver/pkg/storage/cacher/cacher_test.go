@@ -38,6 +38,7 @@ import (
 	"k8s.io/apiserver/pkg/storage"
 	etcd3testing "k8s.io/apiserver/pkg/storage/etcd3/testing"
 	storagetesting "k8s.io/apiserver/pkg/storage/testing"
+	"k8s.io/apiserver/pkg/storage/value/encrypt/identity"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/tools/cache"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
@@ -176,40 +177,40 @@ func TestListPaging(t *testing.T) {
 	storagetesting.RunTestListPaging(ctx, t, cacher)
 }
 
-func TestList(t *testing.T) {
+func TestLists(t *testing.T) {
 	for _, consistentRead := range []bool{true, false} {
-		t.Run(fmt.Sprintf("ConsistentListFromCache=%v", consistentRead), func(t *testing.T) {
-			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ConsistentListFromCache, consistentRead)
-			ctx, cacher, server, terminate := testSetupWithEtcdServer(t)
-			t.Cleanup(terminate)
-			storagetesting.RunTestList(ctx, t, cacher, compactStorage(cacher, server.V3Client.Client), true)
-		})
-	}
-}
-func TestConsistentList(t *testing.T) {
-	for _, consistentRead := range []bool{true, false} {
-		t.Run(fmt.Sprintf("ConsistentListFromCache=%v", consistentRead), func(t *testing.T) {
-			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ConsistentListFromCache, consistentRead)
-			ctx, cacher, server, terminate := testSetupWithEtcdServer(t)
-			t.Cleanup(terminate)
-			storagetesting.RunTestConsistentList(ctx, t, cacher, compactStorage(cacher, server.V3Client.Client), true, consistentRead)
-		})
-	}
-}
+		for _, listFromCacheSnapshot := range []bool{true, false} {
+			t.Run(fmt.Sprintf("ConsistentListFromCache=%v,ListFromCacheSnapshot=%v", consistentRead, listFromCacheSnapshot), func(t *testing.T) {
+				featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ListFromCacheSnapshot, listFromCacheSnapshot)
+				featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ConsistentListFromCache, consistentRead)
+				t.Run("List", func(t *testing.T) {
+					t.Parallel()
+					ctx, cacher, server, terminate := testSetupWithEtcdServer(t)
+					t.Cleanup(terminate)
+					storagetesting.RunTestList(ctx, t, cacher, increaseRV(server.V3Client.Client), true, server.V3Client.Kubernetes.(*storagetesting.KubernetesRecorder))
+				})
 
-func TestGetListNonRecursive(t *testing.T) {
-	for _, consistentRead := range []bool{true, false} {
-		t.Run(fmt.Sprintf("ConsistentListFromCache=%v", consistentRead), func(t *testing.T) {
-			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ConsistentListFromCache, consistentRead)
-			ctx, cacher, server, terminate := testSetupWithEtcdServer(t)
-			t.Cleanup(terminate)
-			storagetesting.RunTestGetListNonRecursive(ctx, t, compactStorage(cacher, server.V3Client.Client), cacher)
-		})
+				t.Run("ConsistentList", func(t *testing.T) {
+					t.Parallel()
+					ctx, cacher, server, terminate := testSetupWithEtcdServer(t)
+					t.Cleanup(terminate)
+					storagetesting.RunTestConsistentList(ctx, t, cacher, increaseRV(server.V3Client.Client), true, consistentRead, listFromCacheSnapshot)
+				})
+
+				t.Run("GetListNonRecursive", func(t *testing.T) {
+					t.Parallel()
+					ctx, cacher, server, terminate := testSetupWithEtcdServer(t)
+					t.Cleanup(terminate)
+					storagetesting.RunTestGetListNonRecursive(ctx, t, increaseRV(server.V3Client.Client), cacher)
+				})
+			})
+		}
 	}
 }
 
 func TestGetListRecursivePrefix(t *testing.T) {
-	ctx, store, _ := testSetup(t)
+	ctx, store, terminate := testSetup(t)
+	t.Cleanup(terminate)
 	storagetesting.RunTestGetListRecursivePrefix(ctx, t, store)
 }
 
@@ -236,10 +237,7 @@ func TestListContinuationWithFilter(t *testing.T) {
 }
 
 func TestListInconsistentContinuation(t *testing.T) {
-	ctx, cacher, terminate := testSetup(t)
-	t.Cleanup(terminate)
 	// TODO(#109831): Enable use of this by setting compaction.
-	storagetesting.RunTestListInconsistentContinuation(ctx, t, cacher, nil)
 }
 
 func TestListResourceVersionMatch(t *testing.T) {
@@ -282,10 +280,15 @@ func TestTransformationFailure(t *testing.T) {
 	// TODO(#109831): Enable use of this test and run it.
 }
 
-func TestCount(t *testing.T) {
-	ctx, cacher, terminate := testSetup(t)
-	t.Cleanup(terminate)
-	storagetesting.RunTestCount(ctx, t, cacher)
+func TestStats(t *testing.T) {
+	for _, sizeBasedListCostEstimate := range []bool{true, false} {
+		t.Run(fmt.Sprintf("SizeBasedListCostEstimate=%v", sizeBasedListCostEstimate), func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.SizeBasedListCostEstimate, sizeBasedListCostEstimate)
+			ctx, cacher, terminate := testSetup(t)
+			t.Cleanup(terminate)
+			storagetesting.RunTestStats(ctx, t, cacher, codecs.LegacyCodec(examplev1.SchemeGroupVersion), identity.NewEncryptCheckTransformer(), sizeBasedListCostEstimate)
+		})
+	}
 }
 
 func TestWatch(t *testing.T) {
@@ -297,7 +300,7 @@ func TestWatch(t *testing.T) {
 func TestWatchFromZero(t *testing.T) {
 	ctx, cacher, server, terminate := testSetupWithEtcdServer(t)
 	t.Cleanup(terminate)
-	storagetesting.RunTestWatchFromZero(ctx, t, cacher, compactStorage(cacher, server.V3Client.Client))
+	storagetesting.RunTestWatchFromZero(ctx, t, cacher, compactWatchCache(cacher, server.V3Client.Client))
 }
 
 func TestDeleteTriggerWatch(t *testing.T) {
@@ -484,10 +487,6 @@ func testSetupWithEtcdServer(t testing.TB, opts ...setupOption) (context.Context
 		t.Fatalf("Failed to initialize cacher: %v", err)
 	}
 	ctx := context.Background()
-	terminate := func() {
-		cacher.Stop()
-		server.Terminate(t)
-	}
 
 	// Since some tests depend on the fact that GetList shouldn't fail,
 	// we wait until the error from the underlying storage is consumed.
@@ -503,8 +502,14 @@ func testSetupWithEtcdServer(t testing.TB, opts ...setupOption) (context.Context
 			t.Fatal(err)
 		}
 	}
+	delegator := NewCacheDelegator(cacher, wrappedStorage)
+	terminate := func() {
+		delegator.Stop()
+		cacher.Stop()
+		server.Terminate(t)
+	}
 
-	return ctx, NewCacheDelegator(cacher, wrappedStorage), server, terminate
+	return ctx, delegator, server, terminate
 }
 
 func testSetupWithEtcdAndCreateWrapper(t *testing.T, opts ...setupOption) (storage.Interface, tearDownFunc) {
@@ -640,4 +645,19 @@ func BenchmarkStoreList(b *testing.B) {
 			}
 		})
 	}
+}
+
+func BenchmarkStoreStats(b *testing.B) {
+	klog.SetLogger(logr.Discard())
+	data := storagetesting.PrepareBenchchmarkData(50, 3_000, 5_000)
+	ctx, cacher, _, terminate := testSetupWithEtcdServer(b)
+	b.Cleanup(terminate)
+	var out example.Pod
+	for _, pod := range data.Pods {
+		err := cacher.Create(ctx, computePodKey(pod), pod, &out, 0)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+	storagetesting.RunBenchmarkStoreStats(ctx, b, cacher)
 }

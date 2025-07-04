@@ -20,11 +20,10 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"reflect"
 	"strings"
-	"sync/atomic"
 	"testing"
 
 	"github.com/go-logr/logr"
@@ -44,10 +43,13 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apiserver/pkg/apis/example"
 	examplev1 "k8s.io/apiserver/pkg/apis/example/v1"
+	"k8s.io/apiserver/pkg/features"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/etcd3/testserver"
 	storagetesting "k8s.io/apiserver/pkg/storage/testing"
 	"k8s.io/apiserver/pkg/storage/value"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/klog/v2"
 )
 
@@ -61,7 +63,7 @@ func init() {
 	utilruntime.Must(example.AddToScheme(scheme))
 	utilruntime.Must(examplev1.AddToScheme(scheme))
 
-	grpclog.SetLoggerV2(grpclog.NewLoggerV2(ioutil.Discard, ioutil.Discard, os.Stderr))
+	grpclog.SetLoggerV2(grpclog.NewLoggerV2(io.Discard, io.Discard, os.Stderr))
 }
 
 func newPod() runtime.Object {
@@ -172,7 +174,7 @@ func TestListPaging(t *testing.T) {
 
 func TestGetListNonRecursive(t *testing.T) {
 	ctx, store, client := testSetup(t)
-	storagetesting.RunTestGetListNonRecursive(ctx, t, compactStorage(client.Client), store)
+	storagetesting.RunTestGetListNonRecursive(ctx, t, increaseRV(client.Client), store)
 }
 
 func TestGetListRecursivePrefix(t *testing.T) {
@@ -249,15 +251,15 @@ func TestTransformationFailure(t *testing.T) {
 
 func TestList(t *testing.T) {
 	ctx, store, client := testSetup(t)
-	storagetesting.RunTestList(ctx, t, store, compactStorage(client.Client), false)
+	storagetesting.RunTestList(ctx, t, store, increaseRV(client.Client), false, client.Kubernetes.(*storagetesting.KubernetesRecorder))
 }
 
 func TestConsistentList(t *testing.T) {
 	ctx, store, client := testSetup(t)
-	storagetesting.RunTestConsistentList(ctx, t, store, compactStorage(client.Client), false, true)
+	storagetesting.RunTestConsistentList(ctx, t, store, increaseRV(client.Client), false, true, false)
 }
 
-func checkStorageCallsInvariants(transformer *storagetesting.PrefixTransformer, recorder *clientRecorder) storagetesting.CallsValidation {
+func checkStorageCallsInvariants(transformer *storagetesting.PrefixTransformer, recorder *storagetesting.KVRecorder) storagetesting.CallsValidation {
 	return func(t *testing.T, pageSize, estimatedProcessedObjects uint64) {
 		if reads := transformer.GetReadsAndReset(); reads != estimatedProcessedObjects {
 			t.Errorf("unexpected reads: %d, expected: %d", reads, estimatedProcessedObjects)
@@ -288,23 +290,23 @@ func checkStorageCallsInvariants(transformer *storagetesting.PrefixTransformer, 
 }
 
 func TestListContinuation(t *testing.T) {
-	ctx, store, client := testSetup(t, withRecorder())
+	ctx, store, client := testSetup(t)
 	validation := checkStorageCallsInvariants(
-		store.transformer.(*storagetesting.PrefixTransformer), client.KV.(*clientRecorder))
+		store.transformer.(*storagetesting.PrefixTransformer), client.KV.(*storagetesting.KVRecorder))
 	storagetesting.RunTestListContinuation(ctx, t, store, validation)
 }
 
 func TestListPaginationRareObject(t *testing.T) {
-	ctx, store, client := testSetup(t, withRecorder())
+	ctx, store, client := testSetup(t)
 	validation := checkStorageCallsInvariants(
-		store.transformer.(*storagetesting.PrefixTransformer), client.KV.(*clientRecorder))
+		store.transformer.(*storagetesting.PrefixTransformer), client.KV.(*storagetesting.KVRecorder))
 	storagetesting.RunTestListPaginationRareObject(ctx, t, store, validation)
 }
 
 func TestListContinuationWithFilter(t *testing.T) {
-	ctx, store, client := testSetup(t, withRecorder())
+	ctx, store, client := testSetup(t)
 	validation := checkStorageCallsInvariants(
-		store.transformer.(*storagetesting.PrefixTransformer), client.KV.(*clientRecorder))
+		store.transformer.(*storagetesting.PrefixTransformer), client.KV.(*storagetesting.KVRecorder))
 	storagetesting.RunTestListContinuationWithFilter(ctx, t, store, validation)
 }
 
@@ -313,15 +315,23 @@ func TestNamespaceScopedList(t *testing.T) {
 	storagetesting.RunTestNamespaceScopedList(ctx, t, store)
 }
 
-func compactStorage(etcdClient *clientv3.Client) storagetesting.Compaction {
+func compactStorage(client *clientv3.Client) storagetesting.Compaction {
 	return func(ctx context.Context, t *testing.T, resourceVersion string) {
 		versioner := storage.APIObjectVersioner{}
 		rv, err := versioner.ParseResourceVersion(resourceVersion)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err = compact(ctx, etcdClient, 0, int64(rv)); err != nil {
+		if _, err = client.Compact(ctx, int64(rv)); err != nil {
 			t.Fatalf("Unable to compact, %v", err)
+		}
+	}
+}
+
+func increaseRV(client *clientv3.Client) storagetesting.IncreaseRVFunc {
+	return func(ctx context.Context, t *testing.T) {
+		if _, err := client.KV.Put(ctx, "increaseRV", "ok"); err != nil {
+			t.Fatalf("Could not update increaseRV: %v", err)
 		}
 	}
 }
@@ -336,9 +346,15 @@ func TestListResourceVersionMatch(t *testing.T) {
 	storagetesting.RunTestListResourceVersionMatch(ctx, t, &storeWithPrefixTransformer{store})
 }
 
-func TestCount(t *testing.T) {
-	ctx, store, _ := testSetup(t)
-	storagetesting.RunTestCount(ctx, t, store)
+func TestStats(t *testing.T) {
+	for _, sizeBasedListCostEstimate := range []bool{true, false} {
+		t.Run(fmt.Sprintf("SizeBasedListCostEstimate=%v", sizeBasedListCostEstimate), func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.SizeBasedListCostEstimate, sizeBasedListCostEstimate)
+			// Match transformer with cacher tests.
+			ctx, store, _ := testSetup(t)
+			storagetesting.RunTestStats(ctx, t, store, store.codec, store.transformer, sizeBasedListCostEstimate)
+		})
+	}
 }
 
 // =======================================================================
@@ -513,20 +529,6 @@ func newTestTransformer() value.Transformer {
 	return storagetesting.NewPrefixTransformer([]byte(defaultTestPrefix), false)
 }
 
-type clientRecorder struct {
-	reads uint64
-	clientv3.KV
-}
-
-func (r *clientRecorder) Get(ctx context.Context, key string, opts ...clientv3.OpOption) (*clientv3.GetResponse, error) {
-	atomic.AddUint64(&r.reads, 1)
-	return r.KV.Get(ctx, key, opts...)
-}
-
-func (r *clientRecorder) GetReadsAndReset() uint64 {
-	return atomic.SwapUint64(&r.reads, 0)
-}
-
 type setupOptions struct {
 	client         func(testing.TB) *kubernetes.Client
 	codec          runtime.Codec
@@ -537,8 +539,6 @@ type setupOptions struct {
 	groupResource  schema.GroupResource
 	transformer    value.Transformer
 	leaseConfig    LeaseManagerConfig
-
-	recorderEnabled bool
 }
 
 type setupOption func(*setupOptions)
@@ -560,12 +560,6 @@ func withPrefix(prefix string) setupOption {
 func withLeaseConfig(leaseConfig LeaseManagerConfig) setupOption {
 	return func(options *setupOptions) {
 		options.leaseConfig = leaseConfig
-	}
-}
-
-func withRecorder() setupOption {
-	return func(options *setupOptions) {
-		options.recorderEnabled = true
 	}
 }
 
@@ -592,11 +586,8 @@ func testSetup(t testing.TB, opts ...setupOption) (context.Context, *store, *kub
 		opt(&setupOpts)
 	}
 	client := setupOpts.client(t)
-	if setupOpts.recorderEnabled {
-		client.KV = &clientRecorder{KV: client.KV}
-	}
 	versioner := storage.APIObjectVersioner{}
-	store := newStore(
+	store := New(
 		client,
 		setupOpts.codec,
 		setupOpts.newFunc,
@@ -609,6 +600,7 @@ func testSetup(t testing.TB, opts ...setupOption) (context.Context, *store, *kub
 		NewDefaultDecoder(setupOpts.codec, versioner),
 		versioner,
 	)
+	t.Cleanup(store.Close)
 	ctx := context.Background()
 	return ctx, store, client
 }
@@ -684,131 +676,6 @@ func TestInvalidKeys(t *testing.T) {
 	expectInvalidKey("Get", store.Get(ctx, invalidKey, storage.GetOptions{}, nil))
 	expectInvalidKey("GetList", store.GetList(ctx, invalidKey, storage.ListOptions{}, nil))
 	expectInvalidKey("GuaranteedUpdate", store.GuaranteedUpdate(ctx, invalidKey, nil, true, nil, nil, nil))
-	_, countErr := store.Count(invalidKey)
-	expectInvalidKey("Count", countErr)
-}
-
-func TestResolveGetListRev(t *testing.T) {
-	_, store, _ := testSetup(t)
-	testCases := []struct {
-		name          string
-		continueKey   string
-		continueRV    int64
-		rv            string
-		rvMatch       metav1.ResourceVersionMatch
-		recursive     bool
-		expectedError string
-		limit         int64
-		expectedRev   int64
-	}{
-		{
-			name:          "specifying resource versionwhen using continue",
-			continueKey:   "continue",
-			continueRV:    100,
-			rv:            "200",
-			expectedError: "specifying resource version is not allowed when using continue",
-		},
-		{
-			name:          "invalid resource version",
-			rv:            "invalid",
-			expectedError: "invalid resource version",
-		},
-		{
-			name:          "unknown ResourceVersionMatch value",
-			rv:            "200",
-			rvMatch:       "unknown",
-			expectedError: "unknown ResourceVersionMatch value",
-		},
-		{
-			name:        "use continueRV",
-			continueKey: "continue",
-			continueRV:  100,
-			rv:          "0",
-			expectedRev: 100,
-		},
-		{
-			name:        "use continueRV with empty rv",
-			continueKey: "continue",
-			continueRV:  100,
-			rv:          "",
-			expectedRev: 100,
-		},
-		{
-			name:        "continueRV = 0",
-			continueKey: "continue",
-			continueRV:  0,
-			rv:          "",
-			expectedRev: 0,
-		},
-		{
-			name:        "continueRV < 0",
-			continueKey: "continue",
-			continueRV:  -1,
-			rv:          "",
-			expectedRev: 0,
-		},
-		{
-			name:        "default",
-			expectedRev: 0,
-		},
-		{
-			name:        "rev resolve to 0 if ResourceVersionMatchNotOlderThan",
-			rv:          "200",
-			rvMatch:     metav1.ResourceVersionMatchNotOlderThan,
-			expectedRev: 0,
-		},
-		{
-			name:        "specified rev if ResourceVersionMatchExact",
-			rv:          "200",
-			rvMatch:     metav1.ResourceVersionMatchExact,
-			expectedRev: 200,
-		},
-		{
-			name:        "rev resolve to 0 if not recursive",
-			rv:          "200",
-			limit:       1,
-			expectedRev: 0,
-		},
-		{
-			name:        "rev resolve to 0 if limit unspecified",
-			rv:          "200",
-			recursive:   true,
-			expectedRev: 0,
-		},
-		{
-			name:        "specified rev if recursive with limit",
-			rv:          "200",
-			recursive:   true,
-			limit:       1,
-			expectedRev: 200,
-		},
-	}
-	for _, tt := range testCases {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			storageOpts := storage.ListOptions{
-				ResourceVersion:      tt.rv,
-				ResourceVersionMatch: tt.rvMatch,
-				Predicate: storage.SelectionPredicate{
-					Limit: tt.limit,
-				},
-				Recursive: tt.recursive,
-			}
-			rev, err := store.resolveGetListRev(tt.continueKey, tt.continueRV, storageOpts)
-			if len(tt.expectedError) > 0 {
-				if err == nil || !strings.Contains(err.Error(), tt.expectedError) {
-					t.Fatalf("expected error: %s, but got: %v", tt.expectedError, err)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("resolveRevForGetList failed: %v", err)
-			}
-			if rev != tt.expectedRev {
-				t.Errorf("%s: expecting rev = %d, but get %d", tt.name, tt.expectedRev, rev)
-			}
-		})
-	}
 }
 
 func BenchmarkStore_GetList(b *testing.B) {
@@ -977,18 +844,21 @@ func BenchmarkStoreList(b *testing.B) {
 		},
 	}
 	for _, dims := range dimensions {
-		b.Run(fmt.Sprintf("Namespaces=%d/Pods=%d/Nodes=%d", dims.namespaceCount, dims.namespaceCount*dims.podPerNamespaceCount, dims.nodeCount), func(b *testing.B) {
-			data := storagetesting.PrepareBenchchmarkData(dims.namespaceCount, dims.podPerNamespaceCount, dims.nodeCount)
-			ctx, store, _ := testSetup(b)
-			var out example.Pod
-			for _, pod := range data.Pods {
-				err := store.Create(ctx, computePodKey(pod), pod, &out, 0)
-				if err != nil {
-					b.Fatal(err)
+		for _, sizeBasedEnabled := range []bool{true, false} {
+			featuregatetesting.SetFeatureGateDuringTest(b, utilfeature.DefaultFeatureGate, features.SizeBasedListCostEstimate, sizeBasedEnabled)
+			b.Run(fmt.Sprintf("SizeBasedListCostEstimate=%v/Namespaces=%d/Pods=%d/Nodes=%d", sizeBasedEnabled, dims.namespaceCount, dims.namespaceCount*dims.podPerNamespaceCount, dims.nodeCount), func(b *testing.B) {
+				data := storagetesting.PrepareBenchchmarkData(dims.namespaceCount, dims.podPerNamespaceCount, dims.nodeCount)
+				ctx, store, _ := testSetup(b)
+				var out example.Pod
+				for _, pod := range data.Pods {
+					err := store.Create(ctx, computePodKey(pod), pod, &out, 0)
+					if err != nil {
+						b.Fatal(err)
+					}
 				}
-			}
-			storagetesting.RunBenchmarkStoreList(ctx, b, store, data, false)
-		})
+				storagetesting.RunBenchmarkStoreList(ctx, b, store, data, false)
+			})
+		}
 	}
 }
 
@@ -1040,4 +910,55 @@ func TestGetCurrentResourceVersion(t *testing.T) {
 	currentPodRV, err := store.versioner.ParseResourceVersion(currentPod.ResourceVersion)
 	require.NoError(t, err)
 	require.Equal(t, currentPodRV, podRV, "didn't expect to see the pod's RV changed")
+}
+
+func BenchmarkStoreStats(b *testing.B) {
+	klog.SetLogger(logr.Discard())
+	data := storagetesting.PrepareBenchchmarkData(50, 3_000, 5_000)
+	ctx, store, _ := testSetup(b)
+	var out example.Pod
+	for _, pod := range data.Pods {
+		err := store.Create(ctx, computePodKey(pod), pod, &out, 0)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+	storagetesting.RunBenchmarkStoreStats(ctx, b, store)
+}
+
+// BenchmarkStatsCacheCleanKeys measures execution time of cleanupKeys which is important for watch latency as blocks watch updates.
+func BenchmarkStatsCacheCleanKeys(b *testing.B) {
+	klog.SetLogger(logr.Discard())
+	namespaceCount := 50
+	podPerNamespaceCount := 3_000
+	data := storagetesting.PrepareBenchchmarkData(namespaceCount, podPerNamespaceCount, 5_000)
+	ctx, store, _ := testSetup(b)
+	var out example.Pod
+	for _, pod := range data.Pods {
+		err := store.Create(ctx, computePodKey(pod), pod, &out, 0)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+	// List to fetch object sizes for statsCache.
+	listOut := &example.PodList{}
+	err := store.GetList(ctx, "/pods/", storage.ListOptions{Recursive: true, Predicate: storage.Everything}, listOut)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if len(store.stats.keys) < namespaceCount*podPerNamespaceCount {
+		b.Fatalf("Unexpected number of keys in stats, want: %d, got: %d", namespaceCount*podPerNamespaceCount, len(store.stats.keys))
+	}
+	// Get keys to measure only cleanupKeys time
+	keys, err := store.getKeys(ctx)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		store.stats.cleanKeys(keys)
+	}
+	if len(store.stats.keys) < namespaceCount*podPerNamespaceCount {
+		b.Fatalf("Unexpected number of keys in stats, want: %d, got: %d", namespaceCount*podPerNamespaceCount, len(store.stats.keys))
+	}
 }

@@ -38,6 +38,8 @@ import (
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
 	cgotesting "k8s.io/client-go/testing"
+	resourceslicetracker "k8s.io/dynamic-resource-allocation/resourceslice/tracker"
+	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
 	"k8s.io/kubernetes/pkg/scheduler/framework/runtime"
@@ -95,7 +97,7 @@ var (
 
 	// Node with "instance-1" device and no device attributes.
 	workerNode      = &st.MakeNode().Name(nodeName).Label("kubernetes.io/hostname", nodeName).Node
-	workerNodeSlice = st.MakeResourceSlice(nodeName, driver).Device("instance-1", nil).Obj()
+	workerNodeSlice = st.MakeResourceSlice(nodeName, driver).Device("instance-1").Obj()
 
 	// Node with same device, but now with a "healthy" boolean attribute.
 	workerNode2      = &st.MakeNode().Name(node2Name).Label("kubernetes.io/hostname", node2Name).Node
@@ -117,9 +119,17 @@ var (
 		Namespace(namespace).
 		Request(className).
 		Obj()
+	claimWithPrioritzedList = st.MakeResourceClaim().
+				Name(claimName).
+				Namespace(namespace).
+				RequestWithPrioritizedList(className).
+				Obj()
 	pendingClaim = st.FromResourceClaim(claim).
 			OwnerReference(podName, podUID, podKind).
 			Obj()
+	pendingClaimWithPrioritizedList = st.FromResourceClaim(claimWithPrioritzedList).
+					OwnerReference(podName, podUID, podKind).
+					Obj()
 	allocationResult = &resourceapi.AllocationResult{
 		Devices: resourceapi.DeviceAllocationResult{
 			Results: []resourceapi.DeviceRequestAllocationResult{{
@@ -133,13 +143,33 @@ var (
 			return st.MakeNodeSelector().In("metadata.name", []string{nodeName}, st.NodeSelectorTypeMatchFields).Obj()
 		}(),
 	}
+	allocationResultWithPrioritizedList = &resourceapi.AllocationResult{
+		Devices: resourceapi.DeviceAllocationResult{
+			Results: []resourceapi.DeviceRequestAllocationResult{{
+				Driver:  driver,
+				Pool:    nodeName,
+				Device:  "instance-1",
+				Request: "req-1/subreq-1",
+			}},
+		},
+		NodeSelector: func() *v1.NodeSelector {
+			return st.MakeNodeSelector().In("metadata.name", []string{nodeName}, st.NodeSelectorTypeMatchFields).Obj()
+		}(),
+	}
 	inUseClaim = st.FromResourceClaim(pendingClaim).
 			Allocation(allocationResult).
 			ReservedForPod(podName, types.UID(podUID)).
 			Obj()
+	inUseClaimWithPrioritizedList = st.FromResourceClaim(pendingClaimWithPrioritizedList).
+					Allocation(allocationResultWithPrioritizedList).
+					ReservedForPod(podName, types.UID(podUID)).
+					Obj()
 	allocatedClaim = st.FromResourceClaim(pendingClaim).
 			Allocation(allocationResult).
 			Obj()
+	allocatedClaimWithPrioritizedList = st.FromResourceClaim(pendingClaimWithPrioritizedList).
+						Allocation(allocationResultWithPrioritizedList).
+						Obj()
 
 	allocatedClaimWithWrongTopology = st.FromResourceClaim(allocatedClaim).
 					Allocation(&resourceapi.AllocationResult{NodeSelector: st.MakeNodeSelector().In("no-such-label", []string{"no-such-value"}, st.NodeSelectorTypeMatchExpressions).Obj()}).
@@ -155,7 +185,21 @@ var (
 	otherAllocatedClaim = st.FromResourceClaim(otherClaim).
 				Allocation(allocationResult).
 				Obj()
+
+	deviceTaint = resourceapi.DeviceTaint{
+		Key:    "taint-key",
+		Value:  "taint-value",
+		Effect: resourceapi.DeviceTaintEffectNoSchedule,
+	}
 )
+
+func taintDevices(slice *resourceapi.ResourceSlice) *resourceapi.ResourceSlice {
+	slice = slice.DeepCopy()
+	for i := range slice.Spec.Devices {
+		slice.Spec.Devices[i].Basic.Taints = append(slice.Spec.Devices[i].Basic.Taints, deviceTaint)
+	}
+	return slice
+}
 
 func reserve(claim *resourceapi.ResourceClaim, pod *v1.Pod) *resourceapi.ResourceClaim {
 	return st.FromResourceClaim(claim).
@@ -201,10 +245,28 @@ func breakCELInClass(class *resourceapi.DeviceClass) *resourceapi.DeviceClass {
 	return class
 }
 
+func updateDeviceClassName(claim *resourceapi.ResourceClaim, deviceClassName string) *resourceapi.ResourceClaim {
+	claim = claim.DeepCopy()
+	for i := range claim.Spec.Devices.Requests {
+		// If the firstAvailable list is empty we update the device class name
+		// on the base request.
+		if len(claim.Spec.Devices.Requests[i].FirstAvailable) == 0 {
+			claim.Spec.Devices.Requests[i].DeviceClassName = deviceClassName
+		} else {
+			// If subrequests are specified, update the device class name on
+			// all of them.
+			for j := range claim.Spec.Devices.Requests[i].FirstAvailable {
+				claim.Spec.Devices.Requests[i].FirstAvailable[j].DeviceClassName = deviceClassName
+			}
+		}
+	}
+	return claim
+}
+
 // result defines the expected outcome of some operation. It covers
 // operation's status and the state of the world (= objects).
 type result struct {
-	status *framework.Status
+	status *fwk.Status
 	// changes contains a mapping of name to an update function for
 	// the corresponding object. These functions apply exactly the expected
 	// changes to a copy of the object as it existed before the operation.
@@ -295,15 +357,18 @@ func TestPlugin(t *testing.T) {
 		// Feature gates. False is chosen so that the uncommon case
 		// doesn't need to be set.
 		disableDRA bool
+
+		enableDRAPrioritizedList bool
+		enableDRADeviceTaints    bool
 	}{
 		"empty": {
 			pod: st.MakePod().Name("foo").Namespace("default").Obj(),
 			want: want{
 				prefilter: result{
-					status: framework.NewStatus(framework.Skip),
+					status: fwk.NewStatus(fwk.Skip),
 				},
 				postfilter: result{
-					status: framework.NewStatus(framework.Unschedulable),
+					status: fwk.NewStatus(fwk.Unschedulable),
 				},
 			},
 		},
@@ -346,7 +411,7 @@ func TestPlugin(t *testing.T) {
 			claims: []*resourceapi.ResourceClaim{allocatedClaim, otherClaim},
 			want: want{
 				preenqueue: result{
-					status: framework.NewStatus(framework.UnschedulableAndUnresolvable, `pod "default/my-pod": ResourceClaim not created yet`),
+					status: fwk.NewStatus(fwk.UnschedulableAndUnresolvable, `pod "default/my-pod": ResourceClaim not created yet`),
 				},
 			},
 		},
@@ -359,7 +424,7 @@ func TestPlugin(t *testing.T) {
 			}(),
 			want: want{
 				preenqueue: result{
-					status: framework.NewStatus(framework.UnschedulableAndUnresolvable, `resourceclaim "my-pod-my-resource" is being deleted`),
+					status: fwk.NewStatus(fwk.UnschedulableAndUnresolvable, `resourceclaim "my-pod-my-resource" is being deleted`),
 				},
 			},
 		},
@@ -372,7 +437,7 @@ func TestPlugin(t *testing.T) {
 			}(),
 			want: want{
 				preenqueue: result{
-					status: framework.NewStatus(framework.UnschedulableAndUnresolvable, `ResourceClaim default/my-pod-my-resource was not created for pod default/my-pod (pod is not owner)`),
+					status: fwk.NewStatus(fwk.UnschedulableAndUnresolvable, `ResourceClaim default/my-pod-my-resource was not created for pod default/my-pod (pod is not owner)`),
 				},
 			},
 		},
@@ -383,11 +448,11 @@ func TestPlugin(t *testing.T) {
 			want: want{
 				filter: perNodeResult{
 					workerNode.Name: {
-						status: framework.NewStatus(framework.UnschedulableAndUnresolvable, `cannot allocate all claims`),
+						status: fwk.NewStatus(fwk.UnschedulableAndUnresolvable, `cannot allocate all claims`),
 					},
 				},
 				postfilter: result{
-					status: framework.NewStatus(framework.Unschedulable, `still not schedulable`),
+					status: fwk.NewStatus(fwk.Unschedulable, `still not schedulable`),
 				},
 			},
 		},
@@ -547,11 +612,61 @@ func TestPlugin(t *testing.T) {
 			want: want{
 				filter: perNodeResult{
 					workerNode.Name: {
-						status: framework.NewStatus(framework.UnschedulableAndUnresolvable, `cannot allocate all claims`),
+						status: fwk.NewStatus(fwk.UnschedulableAndUnresolvable, `cannot allocate all claims`),
 					},
 				},
 				postfilter: result{
-					status: framework.NewStatus(framework.Unschedulable, `still not schedulable`),
+					status: fwk.NewStatus(fwk.Unschedulable, `still not schedulable`),
+				},
+			},
+		},
+
+		// The two test cases for device tainting only need to cover
+		// whether the feature gate is passed through to the allocator
+		// correctly. The actual logic around device taints and allocation
+		// is in the allocator.
+		"tainted-device-disabled": {
+			enableDRADeviceTaints: false,
+			pod:                   podWithClaimName,
+			claims:                []*resourceapi.ResourceClaim{pendingClaim},
+			classes:               []*resourceapi.DeviceClass{deviceClass},
+			objs:                  []apiruntime.Object{taintDevices(workerNodeSlice)},
+			want: want{
+				reserve: result{
+					inFlightClaim: allocatedClaim,
+				},
+				prebind: result{
+					assumedClaim: reserve(allocatedClaim, podWithClaimName),
+					changes: change{
+						claim: func(claim *resourceapi.ResourceClaim) *resourceapi.ResourceClaim {
+							if claim.Name == claimName {
+								claim = claim.DeepCopy()
+								claim.Finalizers = allocatedClaim.Finalizers
+								claim.Status = inUseClaim.Status
+							}
+							return claim
+						},
+					},
+				},
+				postbind: result{
+					assumedClaim: reserve(allocatedClaim, podWithClaimName),
+				},
+			},
+		},
+		"tainted-device-enabled": {
+			enableDRADeviceTaints: true,
+			pod:                   podWithClaimName,
+			claims:                []*resourceapi.ResourceClaim{pendingClaim},
+			classes:               []*resourceapi.DeviceClass{deviceClass},
+			objs:                  []apiruntime.Object{taintDevices(workerNodeSlice)},
+			want: want{
+				filter: perNodeResult{
+					workerNode.Name: {
+						status: fwk.NewStatus(fwk.UnschedulableAndUnresolvable, `cannot allocate all claims`),
+					},
+				},
+				postfilter: result{
+					status: fwk.NewStatus(fwk.Unschedulable, `still not schedulable`),
 				},
 			},
 		},
@@ -598,7 +713,7 @@ func TestPlugin(t *testing.T) {
 			want: want{
 				filter: perNodeResult{
 					workerNode.Name: {
-						status: framework.NewStatus(framework.UnschedulableAndUnresolvable, `claim default/my-pod-my-resource, request req-1: admin access is requested, but the feature is disabled`),
+						status: fwk.NewStatus(fwk.UnschedulableAndUnresolvable, `claim default/my-pod-my-resource, request req-1: admin access is requested, but the feature is disabled`),
 					},
 				},
 			},
@@ -643,7 +758,7 @@ func TestPlugin(t *testing.T) {
 			want: want{
 				filter: perNodeResult{
 					workerNode.Name: {
-						status: framework.AsStatus(errors.New(`claim default/my-pod-my-resource: selector #0: CEL runtime error: no such key: ` + string(attrName))),
+						status: fwk.AsStatus(errors.New(`claim default/my-pod-my-resource: selector #0: CEL runtime error: no such key: ` + string(attrName))),
 					},
 				},
 			},
@@ -657,7 +772,7 @@ func TestPlugin(t *testing.T) {
 			want: want{
 				filter: perNodeResult{
 					workerNode.Name: {
-						status: framework.AsStatus(errors.New(`class my-resource-class: selector #0: CEL runtime error: no such key: ` + string(attrName))),
+						status: fwk.AsStatus(errors.New(`class my-resource-class: selector #0: CEL runtime error: no such key: ` + string(attrName))),
 					},
 				},
 			},
@@ -677,7 +792,7 @@ func TestPlugin(t *testing.T) {
 			want: want{
 				filter: perNodeResult{
 					workerNode.Name: {
-						status: framework.AsStatus(errors.New(`claim default/my-pod-my-resource: selector #0: CEL runtime error: no such key: ` + string(attrName))),
+						status: fwk.AsStatus(errors.New(`claim default/my-pod-my-resource: selector #0: CEL runtime error: no such key: ` + string(attrName))),
 					},
 				},
 			},
@@ -693,12 +808,12 @@ func TestPlugin(t *testing.T) {
 			want: want{
 				filter: perNodeResult{
 					workerNode.Name: {
-						status: framework.NewStatus(framework.UnschedulableAndUnresolvable, `claim default/my-pod-my-resource: selector #0: CEL runtime error: no such key: `+string(attrName)),
+						status: fwk.NewStatus(fwk.UnschedulableAndUnresolvable, `claim default/my-pod-my-resource: selector #0: CEL runtime error: no such key: `+string(attrName)),
 					},
 				},
 				prescore: result{
 					// This is the error found during Filter.
-					status: framework.NewStatus(framework.UnschedulableAndUnresolvable, `filter node worker: claim default/my-pod-my-resource: selector #0: CEL runtime error: no such key: healthy`),
+					status: fwk.NewStatus(fwk.UnschedulableAndUnresolvable, `filter node worker: claim default/my-pod-my-resource: selector #0: CEL runtime error: no such key: healthy`),
 				},
 			},
 		},
@@ -708,10 +823,10 @@ func TestPlugin(t *testing.T) {
 			claims: []*resourceapi.ResourceClaim{pendingClaim},
 			want: want{
 				prefilter: result{
-					status: framework.NewStatus(framework.UnschedulableAndUnresolvable, fmt.Sprintf("request req-1: device class %s does not exist", className)),
+					status: fwk.NewStatus(fwk.UnschedulableAndUnresolvable, fmt.Sprintf("request req-1: device class %s does not exist", className)),
 				},
 				postfilter: result{
-					status: framework.NewStatus(framework.Unschedulable, `no new claims to deallocate`),
+					status: fwk.NewStatus(fwk.Unschedulable, `no new claims to deallocate`),
 				},
 			},
 		},
@@ -723,7 +838,7 @@ func TestPlugin(t *testing.T) {
 			want: want{
 				filter: perNodeResult{
 					workerNode.Name: {
-						status: framework.NewStatus(framework.UnschedulableAndUnresolvable, `resourceclaim not available on the node`),
+						status: fwk.NewStatus(fwk.UnschedulableAndUnresolvable, `resourceclaim not available on the node`),
 					},
 				},
 				postfilter: result{
@@ -735,7 +850,7 @@ func TestPlugin(t *testing.T) {
 								Obj()
 						},
 					},
-					status: framework.NewStatus(framework.Unschedulable, `deallocation of ResourceClaim completed`),
+					status: fwk.NewStatus(fwk.Unschedulable, `deallocation of ResourceClaim completed`),
 				},
 			},
 		},
@@ -787,13 +902,77 @@ func TestPlugin(t *testing.T) {
 			claims: []*resourceapi.ResourceClaim{inUseClaim},
 			want: want{
 				prefilter: result{
-					status: framework.NewStatus(framework.Skip),
+					status: fwk.NewStatus(fwk.Skip),
 				},
 				postfilter: result{
-					status: framework.NewStatus(framework.Unschedulable, `plugin disabled`),
+					status: fwk.NewStatus(fwk.Unschedulable, `plugin disabled`),
 				},
 			},
 			disableDRA: true,
+		},
+		"claim-with-request-with-unknown-device-class": {
+			pod:    podWithClaimName,
+			claims: []*resourceapi.ResourceClaim{updateDeviceClassName(claim, "does-not-exist")},
+			want: want{
+				prefilter: result{
+					status: fwk.NewStatus(fwk.Unschedulable, `request req-1: device class does-not-exist does not exist`),
+				},
+				postfilter: result{
+					status: fwk.NewStatus(fwk.Unschedulable, `no new claims to deallocate`),
+				},
+			},
+		},
+		"claim-with-prioritized-list-feature-disabled": {
+			enableDRAPrioritizedList: false,
+			pod:                      podWithClaimName,
+			claims:                   []*resourceapi.ResourceClaim{claimWithPrioritzedList},
+			classes:                  []*resourceapi.DeviceClass{deviceClass},
+			want: want{
+				prefilter: result{
+					status: fwk.NewStatus(fwk.UnschedulableAndUnresolvable, `claim default/my-pod-my-resource, request req-1: has subrequests, but the DRAPrioritizedList feature is disabled`),
+				},
+				postfilter: result{
+					status: fwk.NewStatus(fwk.Unschedulable, `no new claims to deallocate`),
+				},
+			},
+		},
+		"claim-with-prioritized-list-unknown-device-class": {
+			enableDRAPrioritizedList: true,
+			pod:                      podWithClaimName,
+			claims:                   []*resourceapi.ResourceClaim{updateDeviceClassName(claimWithPrioritzedList, "does-not-exist")},
+			want: want{
+				prefilter: result{
+					status: fwk.NewStatus(fwk.Unschedulable, `request req-1/subreq-1: device class does-not-exist does not exist`),
+				},
+				postfilter: result{
+					status: fwk.NewStatus(fwk.Unschedulable, `no new claims to deallocate`),
+				},
+			},
+		},
+		"claim-with-prioritized-list": {
+			enableDRAPrioritizedList: true,
+			pod:                      podWithClaimName,
+			claims:                   []*resourceapi.ResourceClaim{pendingClaimWithPrioritizedList},
+			classes:                  []*resourceapi.DeviceClass{deviceClass},
+			objs:                     []apiruntime.Object{workerNodeSlice},
+			want: want{
+				reserve: result{
+					inFlightClaim: allocatedClaimWithPrioritizedList,
+				},
+				prebind: result{
+					assumedClaim: reserve(allocatedClaimWithPrioritizedList, podWithClaimName),
+					changes: change{
+						claim: func(claim *resourceapi.ResourceClaim) *resourceapi.ResourceClaim {
+							if claim.Name == claimName {
+								claim = claim.DeepCopy()
+								claim.Finalizers = allocatedClaimWithPrioritizedList.Finalizers
+								claim.Status = inUseClaimWithPrioritizedList.Status
+							}
+							return claim
+						},
+					},
+				},
+			},
 		},
 	}
 
@@ -808,7 +987,9 @@ func TestPlugin(t *testing.T) {
 			}
 			features := feature.Features{
 				EnableDRAAdminAccess:            tc.enableDRAAdminAccess,
+				EnableDRADeviceTaints:           tc.enableDRADeviceTaints,
 				EnableDynamicResourceAllocation: !tc.disableDRA,
+				EnableDRAPrioritizedList:        tc.enableDRAPrioritizedList,
 			}
 			testCtx := setup(t, nodes, tc.claims, tc.classes, tc.objs, features)
 			initialObjects := testCtx.listAll(t)
@@ -821,12 +1002,12 @@ func TestPlugin(t *testing.T) {
 				return
 			}
 
-			result, status := testCtx.p.PreFilter(testCtx.ctx, testCtx.state, tc.pod)
+			result, status := testCtx.p.PreFilter(testCtx.ctx, testCtx.state, tc.pod, nil)
 			t.Run("prefilter", func(t *testing.T) {
 				assert.Equal(t, tc.want.preFilterResult, result)
 				testCtx.verify(t, tc.want.prefilter, initialObjects, result, status)
 			})
-			unschedulable := status.Code() != framework.Success
+			unschedulable := status.Code() != fwk.Success
 
 			var potentialNodes []*framework.NodeInfo
 
@@ -840,10 +1021,10 @@ func TestPlugin(t *testing.T) {
 					t.Run(fmt.Sprintf("filter/%s", nodeInfo.Node().Name), func(t *testing.T) {
 						testCtx.verify(t, tc.want.filter.forNode(nodeName), initialObjects, nil, status)
 					})
-					if status.Code() == framework.Success {
+					if status.Code() == fwk.Success {
 						potentialNodes = append(potentialNodes, nodeInfo)
 					}
-					if status.Code() == framework.Error {
+					if status.Code() == fwk.Error {
 						// An error aborts scheduling.
 						return
 					}
@@ -868,7 +1049,7 @@ func TestPlugin(t *testing.T) {
 				t.Run("reserve", func(t *testing.T) {
 					testCtx.verify(t, tc.want.reserve, initialObjects, nil, status)
 				})
-				if status.Code() != framework.Success {
+				if status.Code() != fwk.Success {
 					unschedulable = true
 				}
 			}
@@ -929,12 +1110,14 @@ type testContext struct {
 	draManager      *DefaultDRAManager
 	p               *DynamicResources
 	nodeInfos       []*framework.NodeInfo
-	state           *framework.CycleState
+	state           fwk.CycleState
 }
 
-func (tc *testContext) verify(t *testing.T, expected result, initialObjects []metav1.Object, result interface{}, status *framework.Status) {
+func (tc *testContext) verify(t *testing.T, expected result, initialObjects []metav1.Object, result interface{}, status *fwk.Status) {
 	t.Helper()
-	if actualErr := status.AsError(); actualErr != nil {
+	if expected.status == nil {
+		assert.Nil(t, status)
+	} else if actualErr := status.AsError(); actualErr != nil {
 		// Compare only the error strings.
 		assert.ErrorContains(t, actualErr, expected.status.AsError().Error())
 	} else {
@@ -1076,7 +1259,16 @@ func setup(t *testing.T, nodes []*v1.Node, claims []*resourceapi.ResourceClaim, 
 	tc.client.PrependReactor("*", "*", reactor)
 
 	tc.informerFactory = informers.NewSharedInformerFactory(tc.client, 0)
-	tc.draManager = NewDRAManager(tCtx, assumecache.NewAssumeCache(tCtx.Logger(), tc.informerFactory.Resource().V1beta1().ResourceClaims().Informer(), "resource claim", "", nil), tc.informerFactory)
+	resourceSliceTrackerOpts := resourceslicetracker.Options{
+		EnableDeviceTaints: true,
+		SliceInformer:      tc.informerFactory.Resource().V1beta1().ResourceSlices(),
+		TaintInformer:      tc.informerFactory.Resource().V1alpha3().DeviceTaintRules(),
+		ClassInformer:      tc.informerFactory.Resource().V1beta1().DeviceClasses(),
+		KubeClient:         tc.client,
+	}
+	resourceSliceTracker, err := resourceslicetracker.StartTracker(tCtx, resourceSliceTrackerOpts)
+	require.NoError(t, err, "couldn't start resource slice tracker")
+	tc.draManager = NewDRAManager(tCtx, assumecache.NewAssumeCache(tCtx.Logger(), tc.informerFactory.Resource().V1beta1().ResourceClaims().Informer(), "resource claim", "", nil), resourceSliceTracker, tc.informerFactory)
 	opts := []runtime.Option{
 		runtime.WithClientSet(tc.client),
 		runtime.WithInformerFactory(tc.informerFactory),
@@ -1191,14 +1383,14 @@ func Test_isSchedulableAfterClaimChange(t *testing.T) {
 		pod            *v1.Pod
 		claims         []*resourceapi.ResourceClaim
 		oldObj, newObj interface{}
-		wantHint       framework.QueueingHint
+		wantHint       fwk.QueueingHint
 		wantErr        bool
 	}{
 		"skip-deletes": {
 			pod:      podWithClaimTemplate,
 			oldObj:   allocatedClaim,
 			newObj:   nil,
-			wantHint: framework.QueueSkip,
+			wantHint: fwk.QueueSkip,
 		},
 		"backoff-wrong-new-object": {
 			pod:     podWithClaimTemplate,
@@ -1212,7 +1404,7 @@ func Test_isSchedulableAfterClaimChange(t *testing.T) {
 				claim.OwnerReferences[0].UID += "123"
 				return claim
 			}(),
-			wantHint: framework.QueueSkip,
+			wantHint: fwk.QueueSkip,
 		},
 		"skip-unrelated-claim": {
 			pod:    podWithClaimTemplate,
@@ -1223,12 +1415,12 @@ func Test_isSchedulableAfterClaimChange(t *testing.T) {
 				claim.UID += "123"
 				return claim
 			}(),
-			wantHint: framework.QueueSkip,
+			wantHint: fwk.QueueSkip,
 		},
 		"queue-on-add": {
 			pod:      podWithClaimName,
 			newObj:   pendingClaim,
-			wantHint: framework.Queue,
+			wantHint: fwk.Queue,
 		},
 		"backoff-wrong-old-object": {
 			pod:     podWithClaimName,
@@ -1246,7 +1438,7 @@ func Test_isSchedulableAfterClaimChange(t *testing.T) {
 				claim.Finalizers = append(claim.Finalizers, "foo")
 				return claim
 			}(),
-			wantHint: framework.QueueSkip,
+			wantHint: fwk.QueueSkip,
 		},
 		"queue-on-status-change": {
 			pod:    podWithClaimName,
@@ -1257,7 +1449,7 @@ func Test_isSchedulableAfterClaimChange(t *testing.T) {
 				claim.Status.Allocation = &resourceapi.AllocationResult{}
 				return claim
 			}(),
-			wantHint: framework.Queue,
+			wantHint: fwk.Queue,
 		},
 		"claim-deallocate": {
 			pod:    podWithClaimName,
@@ -1268,7 +1460,7 @@ func Test_isSchedulableAfterClaimChange(t *testing.T) {
 				claim.Status.Allocation = nil
 				return claim
 			}(),
-			wantHint: framework.Queue,
+			wantHint: fwk.Queue,
 		},
 	}
 
@@ -1348,7 +1540,7 @@ func Test_isSchedulableAfterPodChange(t *testing.T) {
 		pod      *v1.Pod
 		claims   []*resourceapi.ResourceClaim
 		obj      interface{}
-		wantHint framework.QueueingHint
+		wantHint fwk.QueueingHint
 		wantErr  bool
 	}{
 		"backoff-wrong-new-object": {
@@ -1360,7 +1552,7 @@ func Test_isSchedulableAfterPodChange(t *testing.T) {
 			objs:     []apiruntime.Object{pendingClaim},
 			pod:      podWithClaimTemplate,
 			obj:      podWithClaimTemplateInStatus,
-			wantHint: framework.Queue,
+			wantHint: fwk.Queue,
 		},
 		"wrong-pod": {
 			objs: []apiruntime.Object{pendingClaim},
@@ -1371,13 +1563,13 @@ func Test_isSchedulableAfterPodChange(t *testing.T) {
 				return pod
 			}(),
 			obj:      podWithClaimTemplateInStatus,
-			wantHint: framework.QueueSkip,
+			wantHint: fwk.QueueSkip,
 		},
 		"missing-claim": {
 			objs:     nil,
 			pod:      podWithClaimTemplate,
 			obj:      podWithClaimTemplateInStatus,
-			wantHint: framework.QueueSkip,
+			wantHint: fwk.QueueSkip,
 		},
 		"incomplete": {
 			objs: []apiruntime.Object{pendingClaim},
@@ -1391,7 +1583,7 @@ func Test_isSchedulableAfterPodChange(t *testing.T) {
 				}}
 				return pod
 			}(),
-			wantHint: framework.QueueSkip,
+			wantHint: fwk.QueueSkip,
 		},
 	}
 
